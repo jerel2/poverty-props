@@ -14,13 +14,22 @@ const STATS={
   {k:"ints",l:"INT",min:0.4,kind:"nb",step:1},
   {k:"rush_yds",l:"Rush Yds",min:15,kind:"norm",step:5},{k:"rush_att",l:"Rush Att",min:5,kind:"nb",step:1},
   {k:"rec",l:"Rec",min:1.5,kind:"nb",step:1},{k:"rec_yds",l:"Rec Yds",min:15,kind:"norm",step:5},
-  {k:"rush_rec_yds",l:"Rush+Rec Yds",min:30,kind:"norm",step:5,of:["rush_yds","rec_yds"]}]
+  {k:"rush_rec_yds",l:"Rush+Rec Yds",min:30,kind:"norm",step:5,of:["rush_yds","rec_yds"]}],
+ NHL:[
+  {k:"pts",l:"Points",min:0.3,kind:"nb",step:1},{k:"g",l:"Goals",min:0.15,kind:"nb",step:1},{k:"a",l:"Assists",min:0.2,kind:"nb",step:1},
+  {k:"sog",l:"Shots",min:1.2,kind:"nb",step:1},{k:"blk",l:"Blocks",min:0.8,kind:"nb",step:1},{k:"hits",l:"Hits",min:1,kind:"nb",step:1},
+  {k:"saves",l:"Saves",min:15,kind:"nb",step:1}]
 };
-const BASE_COLS={NBA:["pts","reb","ast","fg3m","stl","blk","tov"],NFL:["pass_yds","pass_td","completions","pass_att","ints","rush_yds","rush_att","rec","rec_yds"]};
+STATS.MCBB=STATS.NBA;
+const BASE_COLS={NBA:["pts","reb","ast","fg3m","stl","blk","tov"],NFL:["pass_yds","pass_td","completions","pass_att","ints","rush_yds","rush_att","rec","rec_yds"],
+  NHL:["pts","g","a","sog","blk","hits","saves"],MCBB:["pts","reb","ast","fg3m","stl","blk","tov"]};
+const LEAGUES=["NBA","NFL","NHL","MCBB"];
 // Compact row layouts used in storage
 const ROW={NBA:["date","opp","ha","min","pts","reb","ast","fg3m","stl","blk","tov","post","team"],
-           NFL:["date","opp","ha","pass_yds","pass_td","completions","pass_att","ints","rush_yds","rush_att","rec","rec_yds","post","team","week"]};
-const DEFAULT_YEARS={NBA:5,NFL:10};
+           NFL:["date","opp","ha","pass_yds","pass_td","completions","pass_att","ints","rush_yds","rush_att","rec","rec_yds","post","team","week"],
+           NHL:["date","opp","ha","min","pts","g","a","sog","blk","hits","saves","post","team"],
+           MCBB:["date","opp","ha","min","pts","reb","ast","fg3m","stl","blk","tov","post","team"]};
+const DEFAULT_YEARS={NBA:5,NFL:10,NHL:5,MCBB:5};
 const MODEL_WEIGHT=0.6; // how far a projection may move off the market estimate (0 = trust market, 1 = trust logs)
 
 function lgamma(x){const g=7,c=[0.99999999999980993,676.5203681218851,-1259.1392167224028,771.32342877765313,-176.61502916214059,12.507343278686905,-0.13857109526572012,9.9843695780195716e-6,1.5056327351493116e-7];
@@ -55,7 +64,9 @@ const nameKey=n=>String(n||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").t
 const TEAM_ALIAS={
  NBA:{GS:"GSW",NY:"NYK",SA:"SAS",NO:"NOP",NOH:"NOP",UTAH:"UTA",WSH:"WAS",PHO:"PHX",BRK:"BKN",NJN:"BKN",NJ:"BKN",CHO:"CHA",CHH:"CHA",SEA:"OKC",VAN:"MEM"},
  NFL:{OAK:"LV",SD:"LAC",STL:"LA",LAR:"LA",JAC:"JAX",WSH:"WAS",ARZ:"ARI",HST:"HOU",BLT:"BAL",CLV:"CLE",KAN:"KC",GNB:"GB",NWE:"NE",NOR:"NO",SFO:"SF",TAM:"TB",LVR:"LV"}};
-const team=(lg,t)=>{t=String(t||"").trim().toUpperCase();return TEAM_ALIAS[lg][t]||t;};
+TEAM_ALIAS.NHL={ARI:"UTA",UTAH:"UTA","L.A":"LAK",LA:"LAK","N.J":"NJD",NJ:"NJD","S.J":"SJS",SJ:"SJS","T.B":"TBL",TB:"TBL",MON:"MTL",WAS:"WSH",CLB:"CBJ",NAS:"NSH"};
+TEAM_ALIAS.MCBB={};
+const team=(lg,t)=>{t=String(t||"").trim().toUpperCase();return (TEAM_ALIAS[lg]||{})[t]||t;};
 const valOf=(def,r)=>def.of?def.of.reduce((s,c)=>s+num(r[c]),0):num(r[def.k]);
 
 /* Model one stat for one player.
@@ -129,10 +140,14 @@ function best(rungs,baseRisk,f){
   return b;
 }
 function seasonOf(lg,date){const y=+date.slice(0,4),m=+date.slice(5,7);
-  if(lg==="NBA"){const s=m>=9?y:y-1;return s+"-"+String(s+1).slice(2);} return String(m>=8?y:y-1);}
+  if(lg!=="NFL"){const s=m>=9?y:y-1;return s+"-"+String(s+1).slice(2);} return String(m>=8?y:y-1);}
+// props are stored as short arrays to keep the daily files small
+const PROP_KEYS=["s","kind","mu","varT","muM","varM","estLine","risk","n","sea","l10","l5","vsN","vsAvg","scale","effect","effN"];
+const encodeProp=p=>PROP_KEYS.map(k=>p[k]===undefined?null:p[k]);
+const decodeProp=a=>Array.isArray(a)?Object.fromEntries(PROP_KEYS.map((k,i)=>[k,a[i]])):a;
 const decodeRow=(lg,a)=>{const o={};ROW[lg].forEach((k,i)=>o[k]=a[i]);o.home_away=o.ha?"H":"A";return o;};
 
-const Engine={STATS,BASE_COLS,ROW,DEFAULT_YEARS,MODEL_WEIGHT,lgamma,Phi,makeDist,sides,amToProb,probToAm,payout,clamp,mean,sdev,wstats,num,nameKey,TEAM_ALIAS,team,valOf,modelStat,ladder,best,seasonOf,decodeRow};
+const Engine={STATS,BASE_COLS,LEAGUES,PROP_KEYS,encodeProp,decodeProp,ROW,DEFAULT_YEARS,MODEL_WEIGHT,lgamma,Phi,makeDist,sides,amToProb,probToAm,payout,clamp,mean,sdev,wstats,num,nameKey,TEAM_ALIAS,team,valOf,modelStat,ladder,best,seasonOf,decodeRow};
 root.Engine=Engine;
 if(typeof module!=="undefined"&&module.exports)module.exports=Engine;
 })(typeof window!=="undefined"?window:globalThis);

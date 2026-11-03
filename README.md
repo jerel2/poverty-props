@@ -1,12 +1,12 @@
 # Poverty Props
 
-NBA and NFL player prop analyzer: value board, team head-to-head history, player-vs-opponent history and a player deep dive.
+NBA, NFL, NHL and Division 1 men's college basketball player prop analyzer: value board, team head-to-head history, player-vs-opponent history and a player deep dive.
 
 Live site: https://jerel2.github.io/poverty-props/
 
 ## How it updates
 `.github/workflows/update.yml` runs at about 10:23 AM, 3:23 PM and 6:23 PM Eastern. It:
-1. Downloads NBA box scores and schedules (ESPN data via sportsdataverse) and NFL stats, schedules and injury reports (nflverse).
+1. Downloads NBA and D1 men's college basketball box scores and schedules (ESPN data via sportsdataverse), NHL box scores, schedules and rosters (sportsdataverse), and NFL stats, schedules and injury reports (nflverse).
 2. Reads ESPN's injury feed and scoreboards for injuries, game lines and a score check.
 3. Checks the data (recent games present, scores match, player points add up, injury names matched to real rosters).
 4. Models every prop and publishes the site. If a league fails, the previous site stays up.

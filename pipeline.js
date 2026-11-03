@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /* Poverty Props update pipeline.
-   Usage: node pipeline.js --work DIR [--rotowire rw.json] [--xcheck xc.json] [--prev prev.json] [--today YYYY-MM-DD]
+   Usage: node pipeline.js --work DIR [--rotowire rw.json] [--rotowire-nhl rwn.json] [--xcheck xc.json] [--prev prev.json] [--today YYYY-MM-DD]
+                           [--leagues NBA,NFL,NHL,MCBB]
                            [--espn 1] [--site SITE_DIR]
      --espn 1   read injuries, game lines and the score cross-check straight from ESPN's public feeds
                 (needs open internet, e.g. GitHub Actions)
@@ -44,17 +45,31 @@ function parseCSV(text){
   return{idx,rows:rows.filter(r=>r.length>1)};
 }
 const readCSV=p=>parseCSV(fs.readFileSync(p,"utf8").replace(/^﻿/,""));
+// Streams a large CSV row by row (the college files are ~100MB a season) so memory stays small.
+function streamCSV(p,onRow){
+  const {StringDecoder}=require("string_decoder");const dec=new StringDecoder("utf8");
+  const fd=fs.openSync(p,"r");const buf=Buffer.alloc(4<<20);let idx=null,f="",row=[],q=false,qq=false,n;
+  const emit=()=>{row.push(f);f="";if(!idx){idx={};row.forEach((h,i)=>idx[h.replace(/^\ufeff/,"")]=i);}else if(row.length>1)onRow(row,idx);row=[];};
+  const feed=text=>{for(let i=0;i<text.length;i++){const c=text[i];
+    if(qq){qq=false;if(c==='"'){f+='"';continue;}q=false;}           // "" inside quotes is a literal quote
+    if(q){if(c==='"')qq=true;else f+=c;continue;}
+    if(c==='"')q=true;else if(c===",")row.push(f),f="";else if(c==="\n")emit();else if(c!=="\r")f+=c;}};
+  while((n=fs.readSync(fd,buf,0,buf.length,null))>0)feed(dec.write(buf.subarray(0,n)));
+  feed(dec.end());if(qq)q=false;if(f!==""||row.length)emit();fs.closeSync(fd);return idx||{};
+}
+function cols(idx,names){const o={};Object.entries(names).forEach(([k,n])=>{if(!(n in idx))throw new Error("Missing column "+n);o[k]=idx[n];});return o;}
 const col=(t,name)=>{if(!(name in t.idx))throw new Error("Missing column "+name);return t.idx[name];};
 const n0=v=>v===""||v==null||v==="NA"?"":+v;
 
 /* ---------- inputs from the job (optional) ---------- */
 const readJSON=p=>{try{return p?JSON.parse(fs.readFileSync(p,"utf8")):null;}catch(e){log(`- Could not read ${p}: ${e.message}`);return null;}};
-const RW=readJSON(args.rotowire),PREV=readJSON(args.prev);let XC=readJSON(args.xcheck);
+const RW=readJSON(args.rotowire),RWN=readJSON(args["rotowire-nhl"]),PREV=readJSON(args.prev);let XC=readJSON(args.xcheck);
 
 /* ---------- ESPN feeds (only with --espn) ---------- */
 const ESPN={inj:{},lines:{},ok:{}};
 function getJSON(url){try{const out=execFileSync("curl",["-sSfL","--retry","2","--max-time","60","-H","User-Agent: Mozilla/5.0",url],{maxBuffer:64*1024*1024});return JSON.parse(out.toString());}catch(e){log(`- ESPN request failed: ${url}`);return null;}}
-const ESPN_PATH={NBA:"basketball/nba",NFL:"football/nfl"};
+const ESPN_PATH={NBA:"basketball/nba",NFL:"football/nfl",NHL:"hockey/nhl",MCBB:"basketball/mens-college-basketball"};
+const ESPN_Q={MCBB:"&groups=50&limit=500"};
 const ymd=d=>d.replace(/-/g,"");
 // walk any JSON and collect objects that look like injury entries (have an athlete and a status)
 function findInjuries(node,team,out){
@@ -72,10 +87,10 @@ function loadESPN(lg){
   const inj=getJSON(`https://site.api.espn.com/apis/site/v2/sports/${ESPN_PATH[lg]}/injuries`);
   if(inj){const list=findInjuries(inj,"",[]);ESPN.inj[lg]=list;ESPN.ok[lg]=list.length>0;log(`- ESPN ${lg} injury feed: ${list.length} entries`);}
   // scoreboards: last few days for the cross-check, today/this week for game lines
-  const xs=[];const back=lg==="NBA"?3:8;
-  for(let i=-back;i<=(lg==="NBA"?0:6);i++){const d=addDays(TODAY,i);const sb=getJSON(`https://site.api.espn.com/apis/site/v2/sports/${ESPN_PATH[lg]}/scoreboard?dates=${ymd(d)}`);if(!sb||!sb.events)continue;
+  const xs=[];const back=lg==="NFL"?8:3;
+  for(let i=-back;i<=(lg==="NFL"?6:0);i++){const d=addDays(TODAY,i);const sb=getJSON(`https://site.api.espn.com/apis/site/v2/sports/${ESPN_PATH[lg]}/scoreboard?dates=${ymd(d)}${ESPN_Q[lg]||""}`);if(!sb||!sb.events)continue;
     sb.events.forEach(ev=>{const c=ev.competitions&&ev.competitions[0];if(!c)return;const h=c.competitors.find(x=>x.homeAway==="home"),a=c.competitors.find(x=>x.homeAway==="away");if(!h||!a)return;
-      const H=E.team(lg,h.team.abbreviation),A=E.team(lg,a.team.abbreviation);
+      const H=lg==="MCBB"?MCBB_ID[h.team.id]:E.team(lg,h.team.abbreviation),A=lg==="MCBB"?MCBB_ID[a.team.id]:E.team(lg,a.team.abbreviation);if(!H||!A)return;
       if(c.status&&c.status.type&&c.status.type.completed&&i<0)xs.push({date:etDate(new Date(ev.date)),away:A,home:H,away_score:+a.score,home_score:+h.score});
       const o=c.odds&&c.odds[0];if(o&&i>=0)ESPN.lines[lg+"|"+A+"@"+H]={spread:o.details||"",total:o.overUnder!=null?String(o.overUnder):"",src:o.provider&&o.provider.name?`${o.provider.name} via ESPN`:"ESPN"};});}
   return xs;
@@ -85,6 +100,10 @@ const NBA30=new Set(["ATL","BOS","BKN","CHA","CHI","CLE","DAL","DEN","DET","GSW"
 const NBA_NICK={hawks:"ATL",celtics:"BOS",nets:"BKN",hornets:"CHA",bulls:"CHI",cavaliers:"CLE",mavericks:"DAL",nuggets:"DEN",pistons:"DET",warriors:"GSW",rockets:"HOU",pacers:"IND",clippers:"LAC",lakers:"LAL",grizzlies:"MEM",heat:"MIA",bucks:"MIL",timberwolves:"MIN",pelicans:"NOP",knicks:"NYK",thunder:"OKC",magic:"ORL","76ers":"PHI",sixers:"PHI",suns:"PHX","trail blazers":"POR",blazers:"POR",kings:"SAC",spurs:"SAS",raptors:"TOR",jazz:"UTA",wizards:"WAS"};
 const NFL_NICK={cardinals:"ARI",falcons:"ATL",ravens:"BAL",bills:"BUF",panthers:"CAR",bears:"CHI",bengals:"CIN",browns:"CLE",cowboys:"DAL",broncos:"DEN",lions:"DET",packers:"GB",texans:"HOU",colts:"IND",jaguars:"JAX",chiefs:"KC",raiders:"LV",chargers:"LAC",rams:"LA",dolphins:"MIA",vikings:"MIN",patriots:"NE",saints:"NO",giants:"NYG",jets:"NYJ",eagles:"PHI",steelers:"PIT","49ers":"SF",seahawks:"SEA",buccaneers:"TB",titans:"TEN",commanders:"WAS"};
 const nflTeamFrom=s=>{const k=String(s||"").toLowerCase().trim();const n=Object.keys(NFL_NICK).find(x=>k.endsWith(x));return n?NFL_NICK[n]:E.team("NFL",s);};
+const NHL_NICK={ducks:"ANA",bruins:"BOS",sabres:"BUF",flames:"CGY",hurricanes:"CAR",blackhawks:"CHI",avalanche:"COL","blue jackets":"CBJ",stars:"DAL","red wings":"DET",oilers:"EDM",panthers:"FLA",kings:"LAK",wild:"MIN",canadiens:"MTL",predators:"NSH",devils:"NJD",islanders:"NYI",rangers:"NYR",senators:"OTT",flyers:"PHI",penguins:"PIT",sharks:"SJS",kraken:"SEA",blues:"STL",lightning:"TBL","maple leafs":"TOR",mammoth:"UTA","hockey club":"UTA",canucks:"VAN","golden knights":"VGK",capitals:"WSH",jets:"WPG"};
+const nhlTeamFrom=s=>{const k=String(s||"").toLowerCase().replace(/\s*\(.*\)\s*$/,"").trim();if(NHL_NICK[k])return NHL_NICK[k];const n=Object.keys(NHL_NICK).sort((a,b)=>b.length-a.length).find(x=>k.endsWith(x));return n?NHL_NICK[n]:E.team("NHL",s);};
+const MCBB_ID={},MCBB_NAME={};
+const RECENT={NBA:40,NFL:40,NHL:40,MCBB:10}; // recent games stored with each slate player// ESPN team id -> code, code -> school name (filled by buildMCBB)
 const nbaTeamFrom=s=>{s=String(s||"").trim();const k=s.toLowerCase().replace(/\s*\(.*\)\s*$/,"");return NBA_NICK[k]||NBA_NICK[Object.keys(NBA_NICK).find(n=>k.endsWith(n))]||E.team("NBA",s);};
 const statusNorm=s=>{s=String(s||"").trim();if(/^(out|ofs|o)$/i.test(s)||/out/i.test(s))return"Out";if(/doub/i.test(s))return"Doubtful";if(/gtd|game.?time/i.test(s))return"Questionable";if(/ques/i.test(s))return"Questionable";if(/prob/i.test(s))return"Probable";if(/sus/i.test(s))return"Out";return s||"";};
 
@@ -113,7 +132,7 @@ function buildNBA(){
   const BASE="https://github.com/sportsdataverse/sportsdataverse-data/releases/download";
   const rows=[],teamGame=new Map();const games=[];
   for(const y of seasons){
-    const pb=get(`${BASE}/espn_nba_player_boxscores/player_box_${y}.csv`,`nba_pb_${y}.csv`,{optional:y===endYear?false:true});
+    const pb=get(`${BASE}/espn_nba_player_boxscores/player_box_${y}.csv`,`nba_pb_${y}.csv`,{optional:true});
     if(pb){const t=readCSV(pb);const C=n=>col(t,n);
       const c={gid:C("game_id"),st:C("season_type"),date:C("game_date"),id:C("athlete_id"),name:C("athlete_display_name"),pos:C("athlete_position_abbreviation"),tm:C("team_abbreviation"),opp:C("opponent_team_abbreviation"),ha:C("home_away"),min:C("minutes"),pts:C("points"),reb:C("rebounds"),ast:C("assists"),fg3m:C("three_point_field_goals_made"),stl:C("steals"),blk:C("blocks"),tov:C("turnovers"),dnp:C("did_not_play"),ts:C("team_score")};
       for(const r of t.rows){const st=r[c.st];if(st!=="2"&&st!=="3")continue;
@@ -124,7 +143,7 @@ function buildNBA(){
         rows.push({id:"n"+r[c.id],name:r[c.name],pos:r[c.pos],team:tm,opp:E.team("NBA",r[c.opp]),date:r[c.date],ha:r[c.ha]==="home"?1:0,min:Math.round(+r[c.min]),
           pts:n0(r[c.pts]),reb:n0(r[c.reb]),ast:n0(r[c.ast]),fg3m:n0(r[c.fg3m]),stl:n0(r[c.stl]),blk:n0(r[c.blk]),tov:n0(r[c.tov]),post:st==="3"?1:0,gid:r[c.gid]});}
     }
-    const sc=get(`${BASE}/espn_nba_schedules/nba_schedule_${y}.csv`,`nba_sch_${y}.csv`,{optional:y!==endYear});
+    const sc=get(`${BASE}/espn_nba_schedules/nba_schedule_${y}.csv`,`nba_sch_${y}.csv`,{optional:true});
     if(sc){const t=readCSV(sc);const C=n=>col(t,n);
       const c={id:C("id"),st:C("season_type"),date:C("game_date"),dt:C("game_date_time"),h:C("home_abbreviation"),a:C("away_abbreviation"),hs:C("home_score"),as:C("away_score"),done:C("status_type_completed"),stn:C("status_type_name"),neu:C("neutral_site")};
       for(const r of t.rows){const st=r[c.st];if(st!=="2"&&st!=="3")continue;
@@ -133,10 +152,87 @@ function buildNBA(){
     }
   }
   log(`\n## NBA\n- Seasons loaded: ${seasons.join(", ")} · ${rows.length} player-games · ${games.length} schedule rows`);
+  if(!rows.length||!games.length)throw new Error("No NBA data downloaded");
   // internal check: player points add up to the team score
   let bad=[];teamGame.forEach((v,k)=>{if(Number.isFinite(v.score)&&v.score>0&&v.sum!==v.score)bad.push(`${k.split("|")[1]} ${v.date}: players ${v.sum} vs team ${v.score}`);});
   log(`- Box-score sum check: ${teamGame.size-bad.length}/${teamGame.size} team-games add up${bad.length?"; mismatches: "+bad.slice(0,10).join("; "):""}`);
   return finishLeague("NBA",rows,games,bad);
+}
+
+/* ---------- NHL ---------- */
+const toiMin=t=>{const m=String(t||"").match(/^(\d+):(\d{2})$/);return m?Math.round((+m[1]+ +m[2]/60)*10)/10:"";};
+function buildNHL(){
+  const now=new Date(TODAY+"T12:00:00");const endYear=now.getMonth()>=7?now.getFullYear()+1:now.getFullYear();
+  const seasons=[];for(let y=endYear-5;y<=endYear;y++)seasons.push(y);
+  const BASE="https://github.com/sportsdataverse/sportsdataverse-data/releases/download";
+  const rows=[],games=[],names=new Map(),teamGame=new Map(),skipped=[];
+  for(const y of seasons){
+    // full names and positions (box scores only carry "J. Eichel")
+    const gr=get(`${BASE}/nhl_game_rosters/game_rosters_${y}.csv`,`nhl_gr_${y}.csv`,{optional:true});
+    if(gr){let c=null;streamCSV(gr,(r,idx)=>{c=c||cols(idx,{id:"player_id",name:"full_name",pos:"position_code"});names.set(r[c.id],{name:r[c.name],pos:r[c.pos]});});}
+    const sc=get(`${BASE}/nhl_schedules/nhl_schedule_${y}.csv`,`nhl_sch_${y}.csv`,{optional:true});
+    if(sc){let c=null;streamCSV(sc,(r,idx)=>{c=c||cols(idx,{id:"game_id",type:"game_type",date:"game_date",t:"game_time",h:"home_team_abbr",a:"away_team_abbr",hs:"home_score",as:"away_score",st:"game_state"});
+      const gt=String(r[c.type]);if(!/^(R|P|2|3)$/.test(gt))return;
+      games.push({season:y,id:r[c.id],date:r[c.date],dt:r[c.t],home:E.team("NHL",r[c.h]),away:E.team("NHL",r[c.a]),hs:n0(r[c.hs]),as:n0(r[c.as]),done:/^(OFF|FINAL)$/.test(r[c.st]),status:r[c.st],neutral:0,post:/^(P|3)$/.test(gt)?1:0});});}
+    const pb=get(`${BASE}/nhl_player_boxscores/player_box_${y}.csv`,`nhl_pb_${y}.csv`,{optional:true});
+    if(pb){const head=fs.readFileSync(pb,"utf8").slice(0,4000).split("\n")[0].split(",");
+      if(!head.includes("game_id")){skipped.push(y);continue;} // older files have no game id or date, so games can't be matched reliably
+      let c=null;const gameInfo=new Map(games.filter(g=>g.season===y).map(g=>[g.id,g]));
+      streamCSV(pb,(r,idx)=>{c=c||cols(idx,{gid:"game_id",date:"game_date",id:"player_id",name:"player_name",pos:"position",tm:"team_abbrev",ha:"home_away",g:"goals",a:"assists",pts:"points",sog:"shots_on_goal",blk:"blocked_shots",hits:"hits",toi:"toi",sv:"saves"});
+        const g=gameInfo.get(r[c.gid]);if(!g)return; // preseason or unknown game
+        const tm=E.team("NHL",r[c.tm]);const opp=g.home===tm?g.away:g.home;const min=toiMin(r[c.toi]);if(!(min>0))return;
+        const k=r[c.gid]+"|"+tm;if(!teamGame.has(k))teamGame.set(k,{goals:0,score:g.home===tm?g.hs:g.as,date:g.date});
+        const nm=names.get(r[c.id]);const goalie=(nm&&nm.pos==="G")||r[c.sv]!=="";
+        if(!goalie)teamGame.get(k).goals+=+r[c.g]||0;
+        rows.push({id:"h"+r[c.id],name:nm?nm.name:r[c.name],pos:goalie?"G":(nm&&nm.pos)||r[c.pos],team:tm,opp,date:g.date,ha:g.home===tm?1:0,min,
+          pts:goalie?"":n0(r[c.pts]),g:goalie?"":n0(r[c.g]),a:goalie?"":n0(r[c.a]),sog:goalie?"":n0(r[c.sog]),blk:goalie?"":n0(r[c.blk]),hits:goalie?"":n0(r[c.hits]),
+          saves:goalie?n0(r[c.sv]):"",post:g.post,gid:g.id});});}
+  }
+  log(`\n## NHL\n- Seasons loaded: ${seasons.join(", ")} · ${rows.length} player-games · ${games.length} games · ${names.size} roster names`);
+  if(skipped.length)log(`- Player stats skipped for season files ${skipped.join(", ")}: the source has no game id or date in them. Team results for those seasons are kept.`);
+  if(!rows.length||!games.length)throw new Error("No NHL data downloaded");
+  // internal check: skater goals add up to the team score (shootout winners add one goal to the score but not to a player)
+  const bad=[];teamGame.forEach((v,k)=>{if(Number.isFinite(+v.score)&&v.score!==""&&v.goals!==+v.score&&v.goals+1!==+v.score)bad.push(`${k.split("|")[1]} ${v.date}: players ${v.goals} vs team ${v.score}`);});
+  log(`- Goal sum check: ${teamGame.size-bad.length}/${teamGame.size} team-games add up${bad.length?"; mismatches: "+bad.slice(0,10).join("; "):""}`);
+  return finishLeague("NHL",rows,games,bad);
+}
+
+/* ---------- Men's college basketball (Division 1) ---------- */
+function buildMCBB(){
+  const now=new Date(TODAY+"T12:00:00");const endYear=now.getMonth()>=7?now.getFullYear()+1:now.getFullYear();
+  const seasons=[];for(let y=endYear-5;y<=endYear;y++)seasons.push(y);
+  const BASE="https://github.com/sportsdataverse/sportsdataverse-data/releases/download";
+  const rows=[],games=[],teamGame=new Map();
+  // Division 1 = teams that belong to a D1 conference. Non-D1 opponents have no conference id.
+  const d1=new Set(),abbr={},name={};
+  const schedFiles=seasons.map(y=>[y,get(`${BASE}/espn_mens_college_basketball_schedules/mbb_schedule_${y}.csv`,`mbb_sch_${y}.csv`,{optional:true})]);
+  schedFiles.forEach(([y,f])=>{if(!f)return;let c=null;streamCSV(f,(r,idx)=>{c=c||cols(idx,{h:"home_id",a:"away_id",hc:"home_conference_id",ac:"away_conference_id",hab:"home_abbreviation",aab:"away_abbreviation",hn:"home_location",an:"away_location"});
+    if(r[c.hc])d1.add(r[c.h]);if(r[c.ac])d1.add(r[c.a]);abbr[r[c.h]]=r[c.hab];abbr[r[c.a]]=r[c.aab];name[r[c.h]]=r[c.hn];name[r[c.a]]=r[c.an];});});
+  // unique short codes: ESPN abbreviation, with the team id added if two D1 schools share one
+  // letters and digits only (e.g. "TA&M" -> "TAM") so codes are safe in file and record names
+  const safe=id=>String(abbr[id]||"T"+id).toUpperCase().replace(/[^A-Z0-9]/g,"")||"T"+id;
+  const byAbbr={};[...d1].forEach(id=>{(byAbbr[safe(id)]=byAbbr[safe(id)]||[]).push(id);});
+  [...d1].forEach(id=>{const a=safe(id);const code=byAbbr[a].length>1?`${a}-${id}`:a;MCBB_ID[id]=code;MCBB_NAME[code]=name[id]||code;});
+  schedFiles.forEach(([y,f])=>{if(!f)return;let c=null;streamCSV(f,(r,idx)=>{c=c||cols(idx,{id:"id",st:"season_type",date:"game_date",dt:"game_date_time",h:"home_id",a:"away_id",hs:"home_score",as:"away_score",done:"status_type_completed",stn:"status_type_name",neu:"neutral_site"});
+    const st=r[c.st];if(st!=="2"&&st!=="3")return;if(!d1.has(r[c.h])||!d1.has(r[c.a]))return;
+    games.push({season:y,id:r[c.id],date:r[c.date],dt:r[c.dt],home:MCBB_ID[r[c.h]],away:MCBB_ID[r[c.a]],hs:n0(r[c.hs]),as:n0(r[c.as]),done:/^true$/i.test(r[c.done]),status:r[c.stn],neutral:/^true$/i.test(r[c.neu])?1:0,post:st==="3"?1:0});});});
+  for(const y of seasons){
+    const pb=get(`${BASE}/espn_mens_college_basketball_player_boxscores/player_box_${y}.csv`,`mbb_pb_${y}.csv`,{optional:true});if(!pb)continue;
+    let c=null;streamCSV(pb,(r,idx)=>{c=c||cols(idx,{gid:"game_id",st:"season_type",date:"game_date",id:"athlete_id",name:"athlete_display_name",pos:"athlete_position_abbreviation",tid:"team_id",oid:"opponent_team_id",ha:"home_away",min:"minutes",pts:"points",reb:"rebounds",ast:"assists",fg3m:"three_point_field_goals_made",stl:"steals",blk:"blocks",tov:"turnovers",dnp:"did_not_play",ts:"team_score"});
+      const st=r[c.st];if(st!=="2"&&st!=="3")return;if(!d1.has(r[c.tid])||!d1.has(r[c.oid]))return; // D1 vs D1 games only
+      const tm=MCBB_ID[r[c.tid]];const k=r[c.gid]+"|"+tm;
+      if(!teamGame.has(k))teamGame.set(k,{score:+r[c.ts],sum:0,date:r[c.date]});
+      if(/^true$/i.test(r[c.dnp])||r[c.min]===""||+r[c.min]===0)return;
+      teamGame.get(k).sum+=+r[c.pts]||0;
+      rows.push({id:"m"+r[c.id],name:r[c.name],pos:r[c.pos],team:tm,opp:MCBB_ID[r[c.oid]],date:r[c.date],ha:r[c.ha]==="home"?1:0,min:Math.round(+r[c.min]),
+        pts:n0(r[c.pts]),reb:n0(r[c.reb]),ast:n0(r[c.ast]),fg3m:n0(r[c.fg3m]),stl:n0(r[c.stl]),blk:n0(r[c.blk]),tov:n0(r[c.tov]),post:st==="3"?1:0,gid:r[c.gid]});});
+  }
+  log(`\n## MCBB\n- Seasons loaded: ${seasons.join(", ")} · ${d1.size} Division 1 teams · ${rows.length} player-games (D1 vs D1 only) · ${games.length} games`);
+  if(!rows.length||!games.length)throw new Error("No college data downloaded");
+  const bad=[];teamGame.forEach((v,k)=>{if(Number.isFinite(v.score)&&v.score>0&&v.sum!==v.score)bad.push(`${k.split("|")[1]} ${v.date}: players ${v.sum} vs team ${v.score}`);});
+  log(`- Box-score sum check: ${teamGame.size-bad.length}/${teamGame.size} team-games add up${bad.length?"; mismatches: "+bad.slice(0,10).join("; "):""}`);
+  if(args.espn){const x=loadESPN("MCBB");XC=XC||{};if(!XC.MCBB)XC.MCBB=x;} // needs the team ids built above
+  return finishLeague("MCBB",rows,games,bad);
 }
 
 /* ---------- NFL ---------- */
@@ -170,7 +266,7 @@ function finishLeague(lg,rows,games,sumMismatch,nflInjFile){
   const flags=[];
   // slate
   let slate;
-  if(lg==="NBA")slate=games.filter(g=>g.date===TODAY).map(g=>({id:"g"+g.id,away:g.away,home:g.home,start:g.dt,time:fmtTime(g.dt),status:g.status,neutral:g.neutral}));
+  if(lg!=="NFL")slate=games.filter(g=>g.date===TODAY).map(g=>({id:"g"+g.id,away:g.away,home:g.home,start:g.dt,time:fmtTime(g.dt),status:g.status,neutral:g.neutral}));
   else{const end=addDays(TODAY,6);slate=games.filter(g=>!g.done&&g.date>=TODAY&&g.date<=end).map(g=>({id:g.id,away:g.away,home:g.home,date:g.date,time:fmtNflTime(g.date,g.time),status:"scheduled",neutral:g.neutral,week:g.week,
       spread:g.spread!==""&&g.spread!=="NA"?(+g.spread>0?`${g.home} -${+g.spread}`:+g.spread<0?`${g.away} -${-g.spread}`:"PK"):"",total:g.total&&g.total!=="NA"?String(g.total):"",lineSrc:"nflverse (closing-line feed)"}));}
   log(`- Slate: ${slate.length} games${lg==="NFL"?" in the next 7 days":" on "+TODAY}: ${slate.map(g=>g.away+"@"+g.home).join(", ")||"none"}`);
@@ -179,7 +275,7 @@ function finishLeague(lg,rows,games,sumMismatch,nflInjFile){
   const info=new Map();P.forEach((a,id)=>info.set(id,{id,name:a[0].name,pos:a[0].pos||"",team:a[0].team,key:E.nameKey(a[0].name),last:a[0].date}));
   // freshness: every completed game in the schedule should be in the box data
   const haveGame=new Set(rows.map(r=>r.date+"|"+r.team));
-  const recentDone=games.filter(g=>g.done&&g.date<TODAY&&g.date>=addDays(TODAY,lg==="NBA"?-4:-10));
+  const recentDone=games.filter(g=>g.done&&g.date<TODAY&&g.date>=addDays(TODAY,lg==="NFL"?-10:-4));
   const missing=[];recentDone.forEach(g=>{[g.home,g.away].forEach(t=>{if(!haveGame.has(g.date+"|"+t))missing.push(`${t} ${g.date}`);});});
   const staleTeams=new Set(missing.map(m=>m.split(" ")[0]));
   log(`- Freshness: ${recentDone.length} recent completed games checked; ${missing.length?"MISSING from box data: "+missing.join(", "):"all present"}`);
@@ -200,21 +296,25 @@ function finishLeague(lg,rows,games,sumMismatch,nflInjFile){
   const curSeasonStart=started.filter(g=>g.season===curSeason).reduce((m,g)=>g.date<m?g.date:m,"9999");
   log(`- Current season starts ${curSeasonStart}; props only for players with a game for their team since then`);
   const allCur=[...info.values()].filter(p=>p.last>=addDays(TODAY,-420));
-  const status=new Map(),injList=[],lineup={},gameLines={};let injSource="none";
+  const status=new Map(),injList=[],lineup={},gameLines={},goalieStart={};let injSource="none";
   if(ESPN.ok[lg]){
     injSource="ESPN injury feed (read "+new Date().toLocaleString("en-US",{timeZone:"America/New_York",month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})+" ET)";
-    const NICK=lg==="NBA"?nbaTeamFrom:(s=>nflTeamFrom(s));
-    ESPN.inj[lg].forEach(x=>{const code=x.team?E.team(lg,x.team):NICK(x.teamName);const st=statusNorm(/day.?to.?day/i.test(x.status)?"GTD":/injured reserve|^ir$|pup|nfi/i.test(x.status)?"Out":x.status);if(!st)return;
+    const NICK={NBA:nbaTeamFrom,NFL:nflTeamFrom,NHL:nhlTeamFrom,MCBB:s=>{const k=String(s||"").toLowerCase();const e=Object.entries(MCBB_NAME).find(([,n])=>n.toLowerCase()===k||k.startsWith(n.toLowerCase()+" "));return e?e[0]:"";}}[lg];
+    ESPN.inj[lg].forEach(x=>{const code=lg==="MCBB"?(x.teamName?NICK(x.teamName):""):x.team?E.team(lg,x.team):NICK(x.teamName);if(lg==="MCBB"&&!code)return;const st=statusNorm(/day.?to.?day/i.test(x.status)?"GTD":/injured reserve|^ir$|pup|nfi/i.test(x.status)?"Out":x.status);if(!st)return;
       let p=null,ok=false,why="";
-      if(lg==="NBA"&&x.id&&info.get("n"+x.id)){p=info.get("n"+x.id);ok=p.team===code;why=ok?"":`listed under ${code} but last played for ${p.team}`;}
+      const pre={NBA:"n",MCBB:"m"}[lg];
+      if(pre&&x.id&&info.get(pre+x.id)){p=info.get(pre+x.id);ok=p.team===code;why=ok?"":`listed under ${code} but last played for ${p.team}`;}
       else{const tp=allCur.filter(q=>q.team===code);const m=matchName(x.name,code,tp,allCur);p=m.p;ok=m.ok;why=m.why||"";
         if(m.amb)m.amb.forEach(c=>{const s=status.get(c.id)||{};s.ambiguous=`ESPN lists "${x.name}" as ${st} and it could be this player`;s.verified=false;status.set(c.id,s);});}
       injList.push({team:code,listed:x.name,status:st,player:p?p.name:null,verified:ok,why,detail:x.detail});
       if(p){const s=status.get(p.id)||{};s.status=st;s.verified=ok;s.src="ESPN";status.set(p.id,s);}});
-  } else if(lg==="NBA"&&RW&&Array.isArray(RW.games)){
-    injSource="Rotowire NBA lineups"+(RW.fetchedAt?` (read ${RW.fetchedAt})`:"");
-    RW.games.forEach(g=>{const away=nbaTeamFrom(g.away),home=nbaTeamFrom(g.home);if(g.spread||g.total)gameLines[away+"@"+home]={spread:g.spread||"",total:g.total||""};
-      (g.teams||[]).forEach(T=>{const code=nbaTeamFrom(T.team);lineup[code]=T.lineupStatus||"";
+  } else if((lg==="NBA"&&RW&&Array.isArray(RW.games))||(lg==="NHL"&&RWN&&Array.isArray(RWN.games))){
+    const R=lg==="NBA"?RW:RWN,TF=lg==="NBA"?nbaTeamFrom:nhlTeamFrom;
+    injSource=`Rotowire ${lg} lineups`+(R.fetchedAt?` (read ${R.fetchedAt})`:"");
+    R.games.forEach(g=>{const away=TF(g.away),home=TF(g.home);if(g.spread||g.total)gameLines[away+"@"+home]={spread:g.spread||"",total:g.total||""};
+      (g.teams||[]).forEach(T=>{const code=TF(T.team);lineup[code]=T.lineupStatus||"";
+        if(lg==="NHL"&&T.goalie){const tp=allCur.filter(p=>p.team===code);const m=matchName(T.goalie,code,tp,allCur);
+          if(m.p&&m.ok){goalieStart[code]={id:m.p.id,status:T.goalieStatus||"Expected"};}}
         const tp=allCur.filter(p=>p.team===code);
         (T.starters||[]).forEach(nm=>{const m=matchName(nm,code,tp,allCur);if(m.p&&m.ok){const s=status.get(m.p.id)||{};s.starter=true;status.set(m.p.id,s);}});
         (T.mayNotPlay||[]).forEach(x=>{const st=statusNorm(x.status);const m=matchName(x.name,code,tp,allCur);
@@ -231,7 +331,7 @@ function finishLeague(lg,rows,games,sumMismatch,nflInjFile){
         if(p)status.set(id,{status:st,verified:true,src:"NFL injury report"});});}
     else injSource=`Official week ${wk} report not published in the data yet`;
   }
-  const injChecked=ESPN.ok[lg]?true:lg==="NBA"?!!(RW&&RW.games):injSource.startsWith("Official NFL");
+  const injChecked=ESPN.ok[lg]?true:lg==="NBA"?!!(RW&&RW.games):lg==="NHL"?!!(RWN&&RWN.games):lg==="NFL"?injSource.startsWith("Official NFL"):false;
   if(args.espn&&!ESPN.ok[lg])flags.push("ESPN injury feed returned nothing this run");
   slate.forEach(g=>{const l=ESPN.lines[lg+"|"+g.away+"@"+g.home];if(l&&!gameLines[g.away+"@"+g.home])gameLines[g.away+"@"+g.home]={spread:l.spread,total:l.total,src:l.src};});
   log(`- Injuries: ${injSource}; ${injList.length} listed, ${injList.filter(x=>!x.verified).length} could not be verified against rosters${injList.filter(x=>!x.verified).length?": "+injList.filter(x=>!x.verified).map(x=>`${x.listed} (${x.team}, ${x.why})`).join("; "):""}`);
@@ -242,23 +342,33 @@ function finishLeague(lg,rows,games,sumMismatch,nflInjFile){
   slate.forEach(g=>{
     const players=[];
     [[g.away,g.home],[g.home,g.away]].forEach(([tm,opp])=>{
-      const roster=[...info.values()].filter(p=>p.team===tm&&p.last>=curSeasonStart&&P.get(p.id).some(r=>r.team===tm&&r.date>=curSeasonStart));
+      let roster=[...info.values()].filter(p=>p.team===tm&&p.last>=curSeasonStart&&P.get(p.id).some(r=>r.team===tm&&r.date>=curSeasonStart));
+      // college: only players with a real role (12+ minutes a game this season)
+      if(lg==="MCBB")roster=roster.filter(pi=>{const m=P.get(pi.id).filter(r=>r.date>=curSeasonStart).map(r=>+r.min);return E.mean(m)>=12;});
+      // hockey goalies: only tonight's starter. Use Rotowire's listed starter; otherwise whoever started the team's last game, flagged.
+      let lastG=null;if(lg==="NHL"){const gs=roster.filter(p=>p.pos==="G").map(p=>({p,d:P.get(p.id).find(r=>r.team===tm)})).filter(x=>x.d).sort((a,b)=>b.d.date<a.d.date?-1:1);lastG=gs[0]&&gs[0].p.id;}
       roster.forEach(pi=>{
+        if(lg==="NHL"&&pi.pos==="G"){const gs=goalieStart[tm];if(gs?gs.id!==pi.id:pi.id!==lastG)return;}
         const all=P.get(pi.id);const st=status.get(pi.id)||{};
         const stat=st.status||"Active";
         const mins=all.map(r=>E.num(r.min)).filter(Number.isFinite);
-        const expMin=lg==="NBA"&&mins.length?E.wstats(mins.slice(0,5)).mean:NaN;
+        const expMin=lg!=="NFL"&&mins.length?E.wstats(mins.slice(0,5)).mean:NaN;
         const pflags=[];if(staleTeams.has(tm))pflags.push("Most recent game missing or unconfirmed in data");
+        if(lg==="NHL"&&pi.pos==="G"){const gs=goalieStart[tm];if(!gs)pflags.push("Starting goalie not confirmed (started the team's last game)");else if(!/confirm/i.test(gs.status))pflags.push(`Starting goalie is ${gs.status.toLowerCase()}, not confirmed`);}
         if(!injChecked)pflags.push("Injury status not verified");else if(st.ambiguous)pflags.push(st.ambiguous);else if(st.verified===false)pflags.push("Injury listing not matched to roster");
         const props=[];
-        if(!/^out$/i.test(stat)){defs.forEach(def=>{const m=E.modelStat(def,all,{opp,expMin,asOf:TODAY,status:stat,unverified:!injChecked||st.verified===false});if(m){props.push(m);nProps++;}});}
+        const goalieUnsure=lg==="NHL"&&pi.pos==="G"&&!(goalieStart[tm]&&/confirm/i.test(goalieStart[tm].status));
+        if(!/^out$/i.test(stat)){defs.forEach(def=>{const m=E.modelStat(def,all,{opp,expMin,asOf:TODAY,status:goalieUnsure&&stat==="Active"?"GTD":stat,unverified:!injChecked||st.verified===false});if(m){props.push(m);nProps++;}});}
         if(!props.length&&!/^out$/i.test(stat))return;
         players.push({id:pi.id,name:pi.name,pos:pi.pos,team:tm,opp,status:stat,statusSrc:st.src||"",verified:st.verified!==false,starter:!!st.starter,
           expMin:Number.isFinite(expMin)?Math.round(expMin*10)/10:null,flags:pflags.filter(Boolean),
-          recent:all.slice(0,40).map(r=>compact(lg,r)),vs:all.filter(r=>r.opp===opp).slice(0,40).map(r=>compact(lg,r)),props});
+          recent:all.slice(0,RECENT[lg]).map(r=>compact(lg,r)),vs:all.filter(r=>r.opp===opp).slice(0,RECENT[lg]).map(r=>compact(lg,r)),props:props.map(E.encodeProp)});
       });
     });
     boardDocs.push({id:`${lg}.board.${g.id}`,body:{league:lg,kind:"board",game:g.id,players}});
+    {const none=[g.away,g.home].filter(t=>!players.some(p=>p.team===t));const unplayed=none.filter(t=>![...info.values()].some(p=>p.team===t&&p.last>=curSeasonStart));
+     if(none.length===2&&unplayed.length===2)g.note="Neither team has played this season yet, so rosters aren't confirmed and there are no props.";
+     else if(none.length)g.note=none.map(t=>unplayed.includes(t)?`${t} hasn't played this season yet, so it has no props.`:`${t}: no player qualified for props.`).join(" ");}
   });
   log(`- Modeled ${nProps} props for ${boardDocs.reduce((s,d)=>s+d.body.players.length,0)} players`);
 
@@ -268,7 +378,7 @@ function finishLeague(lg,rows,games,sumMismatch,nflInjFile){
   const h2hDocs=chunkBy(h2h,5000,"rows").map((b,i)=>({id:`${lg}.h2h.${i}`,body:{league:lg,kind:"h2h",...b}}));
 
   // player histories by current team, plus a search index
-  const idxPlayers=[...info.values()].filter(p=>p.last>=addDays(TODAY,lg==="NBA"?-560:-800)).sort((a,b)=>a.name.localeCompare(b.name));
+  const idxPlayers=[...info.values()].filter(p=>p.last>=addDays(TODAY,lg==="NFL"?-800:-560)).sort((a,b)=>a.name.localeCompare(b.name));
   const byTeam={};idxPlayers.forEach(p=>(byTeam[p.team]=byTeam[p.team]||[]).push(p));
   const teamDocs=[],index=[];
   Object.entries(byTeam).forEach(([tm,list])=>{let part=0,cur={},size=0;
@@ -279,11 +389,14 @@ function finishLeague(lg,rows,games,sumMismatch,nflInjFile){
   const meta={league:lg,kind:"meta",slateDate:TODAY,updatedAt:new Date().toISOString(),games:slate.map(g=>({...g,lineup:{away:lineup[g.away]||"",home:lineup[g.home]||""},...(gameLines[g.away+"@"+g.home]?{spread:gameLines[g.away+"@"+g.home].spread,total:gameLines[g.away+"@"+g.home].total,lineSrc:gameLines[g.away+"@"+g.home].src||"Rotowire"}:{})})),
     injuries:{source:injSource,checked:injChecked,list:injList},
     checks:{boxSum:{bad:sumMismatch.slice(0,30)},freshness:{missing},secondFeed:xres,staleTeams:[...staleTeams]},
-    coverage:{seasons:lg==="NBA"?"Last 5 seasons + current":"Last 10 seasons + current",playerGames:rows.length,players:index.length,h2hGames:h2h.length},
-    flags,sources:(lg==="NBA"?["ESPN box scores and schedules via sportsdataverse (GitHub)"]:["nflverse schedules, weekly player stats and official injury reports (GitHub)"]).concat(
-      ESPN.ok[lg]?["ESPN injury feed (injuries)"]:lg==="NBA"&&RW?["Rotowire NBA lineups (injuries, starters, game lines)"]:[],
-      args.espn?[lg==="NBA"?"ESPN scoreboard (game lines; score check, which shares ESPN as the original source)":"ESPN scoreboard (game lines; score cross-check)"]:["Sportradar final scores (cross-check)"])};
-  const docs=[{id:`${lg}.meta`,body:meta},{id:`${lg}.index`,body:{league:lg,kind:"index",players:index}},...h2hDocs,...boardDocs,...teamDocs];
+    teamNames:lg==="MCBB"?Object.fromEntries([...new Set(games.filter(g=>g.date>=addDays(TODAY,-560)).flatMap(g=>[g.home,g.away]))].map(c=>[c,MCBB_NAME[c]||c])):undefined,
+    coverage:{seasons:lg==="NFL"?"Last 10 seasons + current":"Last 5 seasons + current",playerGames:rows.length,players:index.length,h2hGames:h2h.length},
+    flags,sources:({NBA:["ESPN box scores and schedules via sportsdataverse (GitHub)"],NFL:["nflverse schedules, weekly player stats and official injury reports (GitHub)"],
+      NHL:["NHL box scores, schedules and rosters via sportsdataverse (GitHub)"],MCBB:["ESPN men's college basketball box scores and schedules via sportsdataverse (GitHub), Division 1 games only"]}[lg]).concat(
+      ESPN.ok[lg]?["ESPN injury feed (injuries)"]:lg==="NBA"&&RW?["Rotowire NBA lineups (injuries, starters, game lines)"]:lg==="NHL"&&RWN?["Rotowire NHL lineups (injuries, starting goalies, game lines)"]:[],
+      args.espn?[lg==="NFL"?"ESPN scoreboard (game lines; score cross-check)":"ESPN scoreboard (game lines; score check, which shares ESPN as the original source)"]:["Sportradar final scores (cross-check)"])};
+  const indexDocs=chunkBy(index,2500,"players").map((b,i)=>({id:i?`${lg}.index.${i}`:`${lg}.index`,body:{league:lg,kind:"index",...b}}));
+  const docs=[{id:`${lg}.meta`,body:meta},...indexDocs,...h2hDocs,...boardDocs,...teamDocs];
   return docs;
 }
 
@@ -296,8 +409,11 @@ function chunkBy(arr,max,key){const out=[];for(let i=0;i<arr.length;i+=max)out.p
 
 /* ---------- main ---------- */
 const docs=[];let failed=[];
-if(args.espn){const xc={NBA:loadESPN("NBA"),NFL:loadESPN("NFL")};if(!XC)XC=xc;}
-for(const [lg,fn] of [["NBA",buildNBA],["NFL",buildNFL]]){
+const BUILD={NBA:buildNBA,NFL:buildNFL,NHL:buildNHL,MCBB:buildMCBB};
+const RUN=(args.leagues||"NBA,NFL,NHL,MCBB").split(",").map(x=>x.trim().toUpperCase()).filter(x=>BUILD[x]);
+// ESPN college data loads inside buildMCBB, once the team ids exist
+if(args.espn){const xc={};RUN.filter(l=>l!=="MCBB").forEach(l=>xc[l]=loadESPN(l));if(!XC)XC=xc;}
+for(const [lg,fn] of RUN.map(l=>[l,BUILD[l]])){
   try{docs.push(...fn());}catch(e){failed.push(lg);log(`\n## ${lg} FAILED: ${e.message}`);}
 }
 if(!docs.length){fs.writeFileSync(path.join(OUT,"report.md"),report.join("\n"));console.log(JSON.stringify({ok:false,failed}));process.exit(2);}
@@ -306,12 +422,19 @@ const gen="g"+new Date().toISOString().replace(/[-:T]/g,"").slice(0,12);const co
 const written=[];const sizes=[];
 docs.forEach(d=>{const s=JSON.stringify(d.body);if(s.length>250000)throw new Error(`Document too large: ${d.id} ${s.length}`);
   const f=path.join(DOCS,d.id+".json");fs.writeFileSync(f,s);written.push(d.id);sizes.push(s.length);});
+// Player-history ("team") documents rarely change: reuse last run's copy when the content is identical.
+const fnv=str=>{let h=0x811c9dc5;for(let i=0;i<str.length;i++){h^=str.charCodeAt(i);h=Math.imul(h,0x01000193);}return(h>>>0).toString(36)+str.length.toString(36);};
+const tc={},th={};const reuse=new Set();
+docs.forEach((d,i)=>{if(!d.id.includes(".team."))return;const lg=d.id.split(".")[0];const h=fnv(fs.readFileSync(path.join(DOCS,d.id+".json"),"utf8"));th[d.id]=h;
+  const pl=PREV&&PREV.leagues&&PREV.leagues[lg];const prevColl=pl&&((pl.tc&&pl.tc[d.id])||(pl.docs&&pl.docs.includes(d.id)?pl.coll:null));
+  if(pl&&pl.th&&pl.th[d.id]===h&&prevColl){tc[d.id]=prevColl;reuse.add(d.id);}else tc[d.id]=coll;});
 const batches=[];let cur=[],bytes=0;
-docs.forEach((d,i)=>{if(cur.length>=50||bytes+sizes[i]>900000){batches.push(cur);cur=[];bytes=0;}cur.push({op:"set",collection:coll,doc_id:d.id,file_path:path.join(DOCS,d.id+".json")});bytes+=sizes[i];});
+docs.forEach((d,i)=>{if(reuse.has(d.id))return;if(cur.length>=50||bytes+sizes[i]>900000){batches.push(cur);cur=[];bytes=0;}cur.push({op:"set",collection:coll,doc_id:d.id,file_path:path.join(DOCS,d.id+".json")});bytes+=sizes[i];});
 if(cur.length)batches.push(cur);
+log(`- Player-history documents unchanged since last run (not rewritten): ${reuse.size}`);
 // carry forward a failed league's docs from the previous run
-const prevDocs=(PREV&&PREV.docs)||{};const docsByLg={NBA:[],NFL:[]};written.forEach(id=>docsByLg[id.split(".")[0]].push(id));
-const leagues={};["NBA","NFL"].forEach(lg=>{if(failed.includes(lg)&&prevDocs[lg]&&PREV.leagues&&PREV.leagues[lg])leagues[lg]=PREV.leagues[lg];else if(docsByLg[lg].length)leagues[lg]={coll,docs:docsByLg[lg]};});
+const prevDocs=(PREV&&PREV.docs)||{};const docsByLg={NBA:[],NFL:[],NHL:[],MCBB:[]};written.forEach(id=>docsByLg[id.split(".")[0]].push(id));
+const leagues={};E.LEAGUES.forEach(lg=>{if((failed.includes(lg)||!RUN.includes(lg))&&prevDocs[lg]&&PREV.leagues&&PREV.leagues[lg])leagues[lg]=PREV.leagues[lg];else if(docsByLg[lg].length){const t={},h={};docsByLg[lg].forEach(id=>{if(tc[id]&&tc[id]!==coll)t[id]=tc[id];if(th[id])h[id]=th[id];});leagues[lg]={coll,docs:docsByLg[lg],tc:t,th:h};}});
 const pointer={gen,updatedAt:new Date().toISOString(),leagues,docs:Object.fromEntries(Object.entries(leagues).map(([k,v])=>[k,v.docs])),failed,report:report.join("\n").slice(0,60000)};
 fs.writeFileSync(path.join(OUT,"pointer.json"),JSON.stringify(pointer));
 if(args.site){const SD=path.join(path.resolve(args.site),"data");fs.mkdirSync(SD,{recursive:true});
@@ -320,8 +443,9 @@ if(args.site){const SD=path.join(path.resolve(args.site),"data");fs.mkdirSync(SD
   docs.forEach(d=>fs.copyFileSync(path.join(DOCS,d.id+".json"),path.join(SD,d.id+".json")));
   fs.writeFileSync(path.join(SD,"current.json"),JSON.stringify(sp));}
 // delete the previous run's docs that are no longer referenced (they were created once, so version 1)
-const keep=new Set(Object.values(leagues).flatMap(v=>v.docs.map(d=>v.coll+"/"+d)));
-const dels=[];if(PREV&&PREV.leagues)Object.values(PREV.leagues).forEach(v=>v.docs.forEach(d=>{if(!keep.has(v.coll+"/"+d))dels.push({op:"delete",collection:v.coll,doc_id:d,if_version:1});}));
+const where=(v,d)=>((v.tc&&v.tc[d])||v.coll)+"/"+d;
+const keep=new Set(Object.values(leagues).flatMap(v=>v.docs.map(d=>where(v,d))));
+const dels=[],seen=new Set();if(PREV&&PREV.leagues)Object.values(PREV.leagues).forEach(v=>v.docs.forEach(d=>{const w=where(v,d);if(keep.has(w)||seen.has(w))return;seen.add(w);const [c,...rest]=w.split("/");dels.push({op:"delete",collection:c,doc_id:rest.join("/"),if_version:1});}));
 const delBatches=[];for(let i=0;i<dels.length;i+=50)delBatches.push(dels.slice(i,i+50));
 fs.writeFileSync(path.join(OUT,"plan.json"),JSON.stringify({gen,collection:coll,batches,pointerFile:path.join(OUT,"pointer.json"),deletes:delBatches},null,1));
 log(`\n## Output\n- ${docs.length} documents in ${batches.length} write batches; ${dels.length} old documents to delete`);

@@ -130,7 +130,7 @@ details.how ol,details.how ul{margin:8px 0 0;padding-left:20px;max-width:75ch}
 <header class="top"><div class="wrap">
   <div class="brand">Poverty Props <small id="slateDate"></small></div>
   <div class="seg" role="group" aria-label="League">
-    <button id="lgNBA" aria-pressed="true">NBA</button><button id="lgNFL" aria-pressed="false">NFL</button>
+    <button id="lgNBA" aria-pressed="true">NBA</button><button id="lgNFL" aria-pressed="false">NFL</button><button id="lgNHL" aria-pressed="false">NHL</button><button id="lgMCBB" aria-pressed="false" title="Division 1 men's college basketball">MCBB</button>
   </div>
   <span class="status" id="srcStatus">Connecting…</span>
   <nav class="tabs" aria-label="Views">
@@ -146,6 +146,12 @@ details.how ol,details.how ul{margin:8px 0 0;padding-left:20px;max-width:75ch}
 const E=window.Engine;
 const {STATS,BASE_COLS,DEFAULT_YEARS}=E;
 const RUN_TIMES=["10:23 AM","3:23 PM","6:23 PM"]; // scheduled update times, ET
+const LG={
+  NBA:{name:"NBA",minLabel:"Min",timeWord:"minutes",keys:["pts","reb","ast","fg3m"],sumLabel:"Player points add up to team score"},
+  NFL:{name:"NFL",minLabel:null,timeWord:null,keys:["pass_yds","rush_yds","rec","rec_yds"]},
+  NHL:{name:"NHL",minLabel:"TOI",timeWord:"time on ice",keys:["pts","g","a","sog"],sumLabel:"Player goals add up to team score"},
+  MCBB:{name:"Men's college basketball (D1)",minLabel:"Min",timeWord:"minutes",keys:["pts","reb","ast","fg3m"],sumLabel:"Player points add up to team score"}};
+const teamName=t=>{const D=cur();return D&&D.meta&&D.meta.teamNames&&D.meta.teamNames[t]||"";};
 
 /* ============ small helpers ============ */
 const fmtAm=a=>a>0?"+"+a:String(a);
@@ -166,7 +172,7 @@ const etTime=iso=>new Date(iso).toLocaleString("en-US",{timeZone:"America/New_Yo
 
 /* ============ State ============ */
 const S={league:"NBA",view:"board",ver:0,ptr:null,conn:"connecting",
-  L:{NBA:null,NFL:null},loading:{NBA:false,NFL:false},teamCache:{},
+  L:{NBA:null,NFL:null,NHL:null,MCBB:null},loading:{NBA:false,NFL:false,NHL:false,MCBB:false},teamCache:{},
   f:{game:"all",stat:"all",minEdge:2,maxRisk:10,maxJuice:-155,maxPlus:200,onlyPos:true},
   mv:{mode:"top",sort:"model",game:"all"},deep:{game:null,player:null,stat:null},tm:{a:null,b:null,years:null,venue:"all",type:"all"},pv:{id:null,opp:null,years:null,stat:null,line:null}};
 S.my={};try{S.my=JSON.parse(localStorage.getItem("povprops.my")||"{}")||{};}catch(e){S.my={};}
@@ -174,7 +180,7 @@ const saveMy=()=>{try{localStorage.setItem("povprops.my",JSON.stringify(S.my));}
 const myKey=pr=>`${S.league}|${S.L[S.league]&&S.L[S.league].meta.slateDate}|${pr.player.id}|${pr.def.k}`;
 // ladder that uses your book's line and odds when you've entered them
 function lad(pr){const m=S.my[myKey(pr)];if(!m)return{rungs:pr.ladder,main:pr.mainLine,real:false};const l=E.ladder(pr.p,pr.def,{line:m.line,over_odds:m.over,under_odds:m.under});return{rungs:l.rungs,main:l.main,real:true};}
-try{const s=JSON.parse(localStorage.getItem("povprops.f")||"null");if(s)Object.assign(S.f,s);const lg=localStorage.getItem("povprops.lg");if(lg==="NFL"||lg==="NBA")S.league=lg;}catch(e){}
+try{const s=JSON.parse(localStorage.getItem("povprops.f")||"null");if(s)Object.assign(S.f,s);const lg=localStorage.getItem("povprops.lg");if(E.LEAGUES.includes(lg))S.league=lg;}catch(e){}
 const saveF=()=>{try{localStorage.setItem("povprops.f",JSON.stringify(S.f));localStorage.setItem("povprops.lg",S.league);}catch(e){}};
 
 /* ============ Data loading (read-only) ============ */
@@ -184,7 +190,7 @@ const STATIC=!(window.claude&&window.claude.use);
 async function fetchJSON(u){const r=await fetch(u,{cache:"no-store"});if(!r.ok)throw new Error(r.status);return r.json();}
 async function connectStatic(){
   const poll=async()=>{try{const p=await fetchJSON("data/current.json?t="+Date.now());const prev=S.ptr;
-      if(!prev||prev.gen!==p.gen){S.ptr=p;S.L={NBA:null,NFL:null};S.teamCache={};}S.conn="ok";load(S.league);render();}
+      if(!prev||prev.gen!==p.gen){S.ptr=p;S.L={NBA:null,NFL:null,NHL:null,MCBB:null};S.teamCache={};}S.conn="ok";load(S.league);render();}
     catch(e){if(!S.ptr){S.conn="empty";render();}}};
   await poll();setInterval(poll,10*60*1000); // pick up new updates while the page stays open
 }
@@ -197,7 +203,7 @@ async function connect(){
     clearTimeout(timer);
     if(!s.exists){S.conn="empty";render();return;}
     const p=s.data();const prev=S.ptr;S.ptr=p;S.conn="ok";
-    ["NBA","NFL"].forEach(lg=>{const a=prev&&prev.leagues&&prev.leagues[lg],b=p.leagues&&p.leagues[lg];if(!a||!b||a.coll!==b.coll){S.L[lg]=null;}});
+    E.LEAGUES.forEach(lg=>{const a=prev&&prev.leagues&&prev.leagues[lg],b=p.leagues&&p.leagues[lg];if(!a||!b||a.coll!==b.coll){S.L[lg]=null;}});
     S.teamCache={};load(S.league);render();
   },e=>{clearTimeout(timer);S.conn="error";render();});
 }
@@ -206,20 +212,20 @@ async function load(lg){
   S.loading[lg]=true;render();
   const coll=S.ptr.leagues[lg].coll;
   try{
-    if(STATIC){const ids=S.ptr.leagues[lg].docs.filter(id=>/\.(meta|index|h2h\.\d+|board\..+)$/.test(id)&&!id.includes(".team."));
+    if(STATIC){const ids=S.ptr.leagues[lg].docs.filter(id=>/\.(meta|index(\.\d+)?|h2h\.\d+|board\..+)$/.test(id)&&!id.includes(".team."));
       const bodies=await Promise.all(ids.map(id=>fetchJSON(`data/${id}.json?v=${S.ptr.gen}`)));
-      const raw={meta:null,index:null,h2h:[],board:[]};bodies.forEach(b=>{if(b.kind==="meta")raw.meta=b;else if(b.kind==="index")raw.index=b;else if(b.kind==="h2h")raw.h2h.push(...(b.rows||[]));else if(b.kind==="board")raw.board.push(b);});
+      const raw={meta:null,index:[],h2h:[],board:[]};bodies.forEach(b=>{if(b.kind==="meta")raw.meta=b;else if(b.kind==="index")raw.index.push(...(b.players||[]));else if(b.kind==="h2h")raw.h2h.push(...(b.rows||[]));else if(b.kind==="board")raw.board.push(b);});
       if(!raw.meta)throw new Error("missing meta");S.L[lg]=build(lg,raw,coll);S.loading[lg]=false;S.ver++;render();return;}
     const q=await DB.collection(coll).where("league","==",lg).where("kind","in",["meta","index","h2h","board"]).limit(1000).get();
-    const raw={meta:null,index:null,h2h:[],board:[]};
-    q.docs.forEach(d=>{const b=d.data();if(!b)return;if(b.kind==="meta")raw.meta=b;else if(b.kind==="index")raw.index=b;else if(b.kind==="h2h")raw.h2h.push(...(b.rows||[]));else if(b.kind==="board")raw.board.push(b);});
+    const raw={meta:null,index:[],h2h:[],board:[]};
+    q.docs.forEach(d=>{const b=d.data();if(!b)return;if(b.kind==="meta")raw.meta=b;else if(b.kind==="index")raw.index.push(...(b.players||[]));else if(b.kind==="h2h")raw.h2h.push(...(b.rows||[]));else if(b.kind==="board")raw.board.push(b);});
     if(!raw.meta)throw new Error("missing meta");
     S.L[lg]=build(lg,raw,coll);
   }catch(e){S.L[lg]={error:true};}
   S.loading[lg]=false;S.ver++;render();
 }
 function teamDoc(lg,docId){
-  const coll=S.ptr.leagues[lg].coll;const k=coll+"/"+docId;
+  const Lp=S.ptr.leagues[lg];const coll=(Lp.tc&&Lp.tc[docId])||Lp.coll;const k=coll+"/"+docId;
   if(!S.teamCache[k]&&STATIC){S.teamCache[k]={state:"loading"};fetchJSON(`data/${docId}.json?v=${S.ptr.gen}`).then(d=>{S.teamCache[k]={state:"ok",data:d};render();}).catch(()=>{S.teamCache[k]={state:"error"};render();});}
   if(!S.teamCache[k])S.teamCache[k]={state:"loading"},DB.collection(coll).doc(docId).get().then(s=>{S.teamCache[k]={state:"ok",data:s.exists?s.data():null};render();}).catch(()=>{S.teamCache[k]={state:"error"};render();});
   return S.teamCache[k];
@@ -233,12 +239,12 @@ function build(lg,raw,coll){
     const recent=(pp.recent||[]).map(a=>E.decodeRow(lg,a)),vs=(pp.vs||[]).map(a=>E.decodeRow(lg,a));
     const pl={id:pp.id,name:pp.name,pos:pp.pos,team:pp.team,opp:pp.opp,game:g,status:pp.status||"Active",statusSrc:pp.statusSrc,verified:pp.verified,starter:pp.starter,expMin:pp.expMin,flags:pp.flags||[],recent,vs,props:{}};
     players.push(pl);
-    (pp.props||[]).forEach(p=>{const def=STATS[lg].find(d=>d.k===p.s);if(!def)return;const lad=E.ladder(p,def,null);
+    (pp.props||[]).map(E.decodeProp).forEach(p=>{const def=STATS[lg].find(d=>d.k===p.s);if(!def)return;const lad=E.ladder(p,def,null);
       const vals=recent.map(r=>E.valOf(def,r)).filter(Number.isFinite),vsVals=vs.map(r=>E.valOf(def,r)).filter(Number.isFinite);
       const pr={player:pl,def,p,mu:p.mu,muM:p.muM,dTrue:lad.dT,mainLine:lad.main,real:false,ladder:lad.rungs,baseRisk:p.risk,n:p.n,vals,vsVals,rows:recent};
       pl.props[def.k]=pr;props.push(pr);});
   });});
-  const index=(raw.index&&raw.index.players||[]).map(a=>({id:a[0],name:a[1],team:a[2],pos:a[3],doc:a[4],last:a[5]}));
+  const index=(raw.index||[]).map(a=>({id:a[0],name:a[1],team:a[2],pos:a[3],doc:a[4],last:a[5]}));
   return{meta,games,h2h,players,props,index,coll};
 }
 function cur(){return S.L[S.league];}
@@ -266,7 +272,8 @@ function renderBoard(){
     const lu=[g.lineup&&g.lineup.away,g.lineup&&g.lineup.home].some(Boolean)?`<span class="mini">Lineups: ${esc(g.lineup.away||"–")} / ${esc(g.lineup.home||"–")}</span>`:"";
     return `<button class="game" data-game="${esc(g.id)}">
       <div class="row spread"><span class="eyebrow">${esc(g.time||"")}</span>${g.spread||g.total?`<span class="mini">${g.spread?esc(g.spread):""}${g.total?" · O/U "+esc(g.total):""}</span>`:""}</div>
-      <div class="matchup">${esc(g.away)} <span class="at">${g.neutral?"vs":"at"}</span> ${esc(g.home)}</div>
+      <div class="matchup">${esc(g.away)} <span class="at">${g.neutral?"vs":"at"}</span> ${esc(g.home)}</div>${teamName(g.away)?`<div class="mini">${esc(teamName(g.away))} ${g.neutral?"vs":"at"} ${esc(teamName(g.home))}</div>`:""}
+      ${g.note&&!D.players.some(p=>p.game&&p.game.id===g.id)?`<div class="mini" style="color:var(--warn)">${esc(g.note)}</div>`:""}
       <div class="mini">${s?`Last ${s.n}: ${esc(g.away)} ${s.aw}–${s.hw} ${esc(g.home)} · Avg total ${r1(s.avgTot)}`:"No recent meetings"}</div>${lu}
       <div class="pick">${top?`Top value: <b>${esc(top.pr.player.name)}</b> ${esc(top.pr.def.l)} ${sideTxt(top.b)} <span class="pos">EV ${sgnPct(top.b.ev)}</span>`:`<span class="mini">No +EV picks under current filters</span>`}</div>
     </button>`;}).join("");
@@ -310,7 +317,7 @@ function renderBoard(){
     <details class="how"><summary>How the numbers work</summary>
       <ul class="note">
         <li><b>Line and Price are estimates (EST)</b> unless you entered your book's odds (YOURS). No sportsbook prop feed is reachable, so the estimated line is what a sharp book would likely post from recent form and minutes. Alt prices assume a 4.5% book margin. EST edges are a screen, not a price: open the player and enter your book's line to get a real edge.</li>
-        <li><b>Proj</b>: recency-weighted average from every game in the data${S.league==="NBA"?", scaled to expected minutes (average of the last 5 games)":""}, adjusted for how the player has done vs. this opponent relative to his own level (last 3 seasons, at most ±10%), then pulled 40% back toward the estimated line. Since books also price recent form and minutes, matchup history is the model's main source of edge.</li>
+        <li><b>Proj</b>: recency-weighted average from every game in the data${LG[S.league].timeWord?`, scaled to expected ${LG[S.league].timeWord} (average of the last 5 games)`:""}, adjusted for how the player has done vs. this opponent relative to his own level (last 3 seasons, at most ±10%), then pulled 40% back toward the estimated line. Since books also price recent form and minutes, matchup history is the model's main source of edge.</li>
         <li><b>Value line</b>: the over/under rung with the highest EV inside your juice limits and with a true hit rate of at least 45%.</li>
         <li><b>True %</b>: from a negative-binomial (counts) or normal (yardage) fit. <b>Edge</b> = True − Implied. <b>EV/u</b> = profit per 1 unit staked.</li>
         <li><b>Risk</b> (1–10): volatility, sample size, minutes swings, injury tag, unverified injury status, recent role change, and price length.</li>
@@ -389,11 +396,11 @@ function renderDeep(){
   if(!S.deep.player||!gp.find(p=>p.id===S.deep.player)){const t=rankedProps().find(x=>x.pr.player.game.id===g.id);S.deep.player=t?t.pr.player.id:gp[0]?.id;S.deep.stat=t?t.pr.def.k:null;}
   const pl=gp.find(p=>p.id===S.deep.player);
   const rows=h2hFor(D,g),s=h2hSummary(g,rows);
-  const main=p=>{const k=S.league==="NBA"?"pts":null;const pr=k&&p.props[k]||Object.values(p.props)[0];return pr?pr.mu:0;};
+  const main=p=>{const k=S.league==="NFL"?null:"pts";const pr=k&&p.props[k]||Object.values(p.props)[0];return pr?pr.mu:0;};
   const listFor=tm=>gp.filter(p=>p.team===tm).sort((a,b)=>main(b)-main(a)).map(p=>`<button data-pick="${esc(p.id)}" aria-pressed="${p.id===S.deep.player}"><span>${esc(p.name)} <span class="mini">${esc(p.pos||"")}</span></span>${/active/i.test(p.status)?(p.flags.length?'<span class="tag est">CHECK</span>':""):`<span class="tag inj">${esc(p.status)}</span>`}</button>`).join("");
   const gameOpts=D.games.map(x=>`<option value="${esc(x.id)}" ${x.id===g.id?"selected":""}>${esc(x.away)} @ ${esc(x.home)}</option>`).join("");
   const h2hRows=rows.map(r=>{const w=r.away_score>r.home_score?r.away:r.home;return `<tr><td class="l num">${esc(r.date)}</td><td class="l">${esc(r.away)} ${r.neutral?"vs":"@"} ${esc(r.home)}${r.game_type==="POST"?' <span class="tag mkt">PLAYOFF</span>':""}</td><td class="num">${r.away_score}–${r.home_score}</td><td class="l"><b>${esc(w)}</b></td><td class="num">${r.away_score+r.home_score}</td><td class="num">${Math.abs(r.away_score-r.home_score)}</td></tr>`;}).join("");
-  const k=S.league==="NBA"?["pts","reb","ast","fg3m"]:["pass_yds","rush_yds","rec","rec_yds"];const kd=k.map(x=>STATS[S.league].find(d=>d.k===x));
+  const k=LG[S.league].keys;const kd=k.map(x=>STATS[S.league].find(d=>d.k===x));
   const vsTbl=gp.filter(p=>p.vs.length).map(p=>`<tr><td class="l">${esc(p.name)} <span class="mini">${esc(p.team)}</span></td><td class="num">${p.vs.length}</td>${kd.map(d=>`<td class="num">${r1(mean(p.vs.map(r=>E.valOf(d,r)).filter(Number.isFinite)))}</td>`).join("")}</tr>`).join("");
   return `${freshness(D)}
   <section class="row spread"><div class="row"><label class="eyebrow" for="dGame">Game</label><select id="dGame">${gameOpts}</select></div>
@@ -442,12 +449,12 @@ function playerPanel(pl){
     return `<tr class="${isBest?"best":""}"><td>${sideTxt(c)}${c.main?' <span class="tag">MAIN</span>':""}</td><td class="num">${fmtAm(c.price)} ${c.est?'<span class="tag est">EST</span>':'<span class="tag mkt">YOURS</span>'}</td><td class="num">${pct(c.imp)}</td><td class="num">${pct(c.p)}</td><td class="num ${c.edge>=0?"pos":"neg"}">${sgnPct(c.edge)}</td><td class="num ${c.ev>=0?"pos":"neg"}">${(c.ev>=0?"+":"")+c.ev.toFixed(3)}</td></tr>`;}).join("");
   const val=x=>E.valOf(pr.def,x);const lg=S.league;
   const others=BASE_COLS[lg].filter(c=>c!==pr.def.k).slice(0,5);
-  const logRows=pr.rows.slice(0,25).map(r=>{const v=val(r);const hit=v>L?"pos":v<L?"neg":"";return `<tr><td class="l num">${esc(r.date)}</td><td class="l">${r.ha?"vs":"@"} ${esc(r.opp)}${r.opp===pl.opp?' <span class="tag">OPP</span>':""}</td>${lg==="NBA"?`<td class="num">${esc(r.min)}</td>`:""}<td class="num ${hit}"><b>${Number.isFinite(v)?v:"–"}</b></td>${others.map(c=>`<td class="num">${esc(r[c]??"")}</td>`).join("")}</tr>`;}).join("");
+  const logRows=pr.rows.slice(0,25).map(r=>{const v=val(r);const hit=v>L?"pos":v<L?"neg":"";return `<tr><td class="l num">${esc(r.date)}</td><td class="l">${r.ha?"vs":"@"} ${esc(r.opp)}${r.opp===pl.opp?' <span class="tag">OPP</span>':""}</td>${LG[lg].minLabel?`<td class="num">${esc(r.min)}</td>`:""}<td class="num ${hit}"><b>${Number.isFinite(v)?v:"–"}</b></td>${others.map(c=>`<td class="num">${esc(r[c]??"")}</td>`).join("")}</tr>`;}).join("");
   const chrono=pr.rows.slice(0,15).reverse();
   const chart=barsSVG({vals:chrono.map(val),labels:chrono.map(r=>r.opp),sub:chrono.map(r=>r.date.slice(5)),line:L,ref:pr.mu,refLabel:"proj",colorOf:v=>v>L?"var(--good)":v<L?"var(--bad)":"var(--muted)",hl:chrono.map(r=>r.opp===pl.opp),aria:`${pl.name} last ${chrono.length} games`});
   return `
   <div class="row spread"><div><div class="eyebrow">${esc(pl.team)} · ${esc(pl.pos||"")} · vs ${esc(pl.opp)}</div><h2>${esc(pl.name)}</h2></div>
-    <div class="row mini">${statusLine}${lg==="NBA"&&pl.expMin!=null?`<span>Exp. min <b>${r1(pl.expMin)}</b> <span class="tag est">EST</span></span>`:""}<span>${pr.n} games</span></div></div>
+    <div class="row mini">${statusLine}${LG[lg].minLabel&&pl.expMin!=null?`<span>Exp. ${LG[lg].minLabel==="TOI"?"TOI":"min"} <b>${r1(pl.expMin)}</b> <span class="tag est">EST</span></span>`:""}<span>${pr.n} games</span></div></div>
   ${flagBox}
   <div class="stattabs" role="group" aria-label="Stat">${tabs}</div>
   <div class="verdict">
@@ -469,7 +476,7 @@ function playerPanel(pl){
   <div class="chart">${chart}</div>
   <div class="grid2">
     <div><h3 style="margin-bottom:8px">Alt-line ladder</h3><div class="tbl"><table><thead><tr><th class="l">Line</th><th>Price</th><th>Implied</th><th>True</th><th>Edge</th><th>EV/u</th></tr></thead><tbody>${ladderRows}</tbody></table></div></div>
-    <div><h3 style="margin-bottom:8px">Recent games</h3><div class="tbl"><table><thead><tr><th class="l">Date</th><th class="l">Opp</th>${lg==="NBA"?"<th>Min</th>":""}<th>${esc(pr.def.l)}</th>${others.map(c=>`<th>${(STATS[lg].find(d=>d.k===c)||{l:c}).l}</th>`).join("")}</tr></thead><tbody>${logRows}</tbody></table></div></div>
+    <div><h3 style="margin-bottom:8px">Recent games</h3><div class="tbl"><table><thead><tr><th class="l">Date</th><th class="l">Opp</th>${LG[lg].minLabel?`<th>${LG[lg].minLabel}</th>`:""}<th>${esc(pr.def.l)}</th>${others.map(c=>`<th>${(STATS[lg].find(d=>d.k===c)||{l:c}).l}</th>`).join("")}</tr></thead><tbody>${logRows}</tbody></table></div></div>
   </div>`;
 }
 
@@ -498,7 +505,7 @@ function searchItems(kind){
   const D=cur();if(!D||D.error)return[];
   if(kind==="teamA"||kind==="teamB"){const cnt={};D.h2h.forEach(r=>{cnt[r.away]=(cnt[r.away]||0)+1;cnt[r.home]=(cnt[r.home]||0)+1;});
     const other=kind==="teamA"?S.tm.b:S.tm.a;
-    return Object.keys(cnt).filter(t=>t!==other).map(t=>{const vs=other?D.h2h.filter(r=>(r.away===t&&r.home===other)||(r.home===t&&r.away===other)).length:0;return{v:t,label:t,sub:other?`${vs} games vs ${other}`:`${cnt[t]} games`,keys:[t]};});}
+    return Object.keys(cnt).filter(t=>t!==other).map(t=>{const vs=other?D.h2h.filter(r=>(r.away===t&&r.home===other)||(r.home===t&&r.away===other)).length:0;const nm=teamName(t);return{v:t,label:nm?`${t} · ${nm}`:t,sub:other?`${vs} games vs ${other}`:`${cnt[t]} games`,keys:nm?[t,nm]:[t]};});}
   if(kind==="pvPlayer")return D.index.map(p=>({v:p.id,label:p.name,sub:`${p.team}${p.pos?" · "+p.pos:""}`,keys:[p.name,p.team]}));
   if(kind==="pvOpp"){const t=pvRows();if(!t)return[];const c={};t.rows.forEach(r=>c[r.opp]=(c[r.opp]||0)+1);return Object.entries(c).map(([o,n])=>({v:o,label:o,sub:`${n} games`,keys:[o]}));}
   return[];
@@ -552,7 +559,7 @@ function renderTeams(){
   const gameRows=G.slice().reverse().map(g=>`<tr><td class="l num">${esc(g.date)}</td><td class="l num">${esc(g.season)}</td><td class="l">${esc(g.away)} ${g.neutral?"vs":"@"} ${esc(g.home)}${g.neutral?' <span class="tag">NEUTRAL</span>':""}${g.game_type==="POST"?' <span class="tag mkt">PLAYOFF</span>':""}</td><td class="num">${esc(A)} ${g.pa} – ${g.pb} ${esc(B)}</td><td class="l"><b>${esc(g.win)}</b></td><td class="num">${g.tot}</td><td class="num">${fmtDelta(g.m)}</td></tr>`).join("");
   const chart=barsSVG({vals:G.map(g=>g.m),labels:G.map(g=>g.season.slice(2)),sub:G.map(g=>g.neutral?"N":(g.aHome?"H":"A")+(g.game_type==="POST"?"*":"")),signed:true,colorOf:v=>v>0?"var(--good)":"var(--bad)",aria:`${A} margin vs ${B}`});
   return head+`<section class="panel" style="display:flex;flex-direction:column;gap:14px">
-    <div class="row spread"><div class="vsbig">${esc(A)} <span class="dash">vs</span> ${esc(B)}</div><span class="mini">${G.length} games · ${years==="all"?"all loaded":"last "+years+" years"}</span></div>
+    <div class="row spread"><div><div class="vsbig">${esc(A)} <span class="dash">vs</span> ${esc(B)}</div>${teamName(A)?`<div class="mini">${esc(teamName(A))} vs ${esc(teamName(B))}</div>`:""}</div><span class="mini">${G.length} games · ${years==="all"?"all loaded":"last "+years+" years"}</span></div>
     <div class="tiles">${tiles}</div>
     <div><h3 style="margin-bottom:6px">${esc(A)} margin by game</h3><div class="mini" style="margin-bottom:6px">Oldest to newest. Green = ${esc(A)} win. H/A/N = ${esc(A)} home, away or neutral. * = playoffs.</div>${chart}</div>
     <p class="note" style="margin:0">${coverage}</p></section>
@@ -595,14 +602,14 @@ function renderPlayers(){
   const vsVals=vs.map(r=>E.valOf(def,r)).filter(Number.isFinite);
   const hr=arr=>arr.length?{o:arr.filter(v=>v>line).length,u:arr.filter(v=>v<line).length,n:arr.length}:null;
   const pos=ix.pos||"";
-  const keys=lg==="NBA"?["pts","reb","ast","fg3m","pra"]:(/QB/.test(pos)?["pass_yds","pass_td","completions","rush_yds"]:/RB|FB/.test(pos)?["rush_yds","rush_att","rec","rec_yds"]:["rec","rec_yds","rush_rec_yds"]);
+  const keys=lg==="NBA"||lg==="MCBB"?["pts","reb","ast","fg3m","pra"]:lg==="NHL"?(pos==="G"?["saves"]:["pts","g","a","sog","blk"]):(/QB/.test(pos)?["pass_yds","pass_td","completions","rush_yds"]:/RB|FB/.test(pos)?["rush_yds","rush_att","rec","rec_yds"]:["rec","rec_yds","rush_rec_yds"]);
   const kdefs=keys.map(k=>defs.find(d=>d.k===k)).filter(Boolean);
   const avgTiles=kdefs.map(d=>{const v1=mean(vs.map(r=>E.valOf(d,r)).filter(Number.isFinite)),v0=mean(win.map(r=>E.valOf(d,r)).filter(Number.isFinite));return `<div class="tile"><div class="v">${r1(v1)}</div><div class="l">${d.l} vs ${esc(opp)}</div><div class="s">${r1(v0)} overall · ${fmtDelta(v1-v0)}</div></div>`;}).join("");
   const hitTile=(h,l)=>`<div class="tile"><div class="v">${h?`${h.o}–${h.u}`:"–"}</div><div class="l">${l}</div><div class="s">${h?`Over ${pct(h.o/h.n,0)} · ${h.n-h.o-h.u} push`:"No games"}</div></div>`;
   const bySeason={};vs.forEach(r=>{const s=seasonOf(lg,r.date);(bySeason[s]=bySeason[s]||[]).push(r);});
   const seasonRows=Object.keys(bySeason).sort().reverse().map(s=>{const a=bySeason[s];return `<tr><td class="l num">${esc(s)}</td><td class="num">${a.length}</td>${kdefs.map(d=>`<td class="num">${r1(mean(a.map(r=>E.valOf(d,r)).filter(Number.isFinite)))}</td>`).join("")}<td class="num">${a.filter(r=>E.valOf(def,r)>line).length}/${a.length}</td></tr>`;}).join("");
   const cols=BASE_COLS[lg];
-  const logRows=vs.map(r=>{const v=E.valOf(def,r);return `<tr><td class="l num">${esc(r.date)}</td><td class="l num">${esc(seasonOf(lg,r.date))}${r.post?' <span class="tag mkt">PO</span>':""}</td><td class="l">${r.ha?"vs":"@"} ${esc(r.opp)} <span class="mini">${esc(r.team)}</span></td>${lg==="NBA"?`<td class="num">${esc(r.min)}</td>`:""}<td class="num ${v>line?"pos":v<line?"neg":""}"><b>${Number.isFinite(v)?v:"–"}</b></td>${cols.filter(c=>c!==def.k).map(c=>`<td class="num">${esc(r[c]??"")}</td>`).join("")}</tr>`;}).join("");
+  const logRows=vs.map(r=>{const v=E.valOf(def,r);return `<tr><td class="l num">${esc(r.date)}</td><td class="l num">${esc(seasonOf(lg,r.date))}${r.post?' <span class="tag mkt">PO</span>':""}</td><td class="l">${r.ha?"vs":"@"} ${esc(r.opp)} <span class="mini">${esc(r.team)}</span></td>${LG[lg].minLabel?`<td class="num">${esc(r.min)}</td>`:""}<td class="num ${v>line?"pos":v<line?"neg":""}"><b>${Number.isFinite(v)?v:"–"}</b></td>${cols.filter(c=>c!==def.k).map(c=>`<td class="num">${esc(r[c]??"")}</td>`).join("")}</tr>`;}).join("");
   const chrono=vs.slice().reverse();
   const chart=barsSVG({vals:chrono.map(r=>E.valOf(def,r)),labels:chrono.map(r=>r.date.slice(2,7)),sub:chrono.map(r=>(r.ha?"H":"A")+(r.post?"*":"")),line,ref:vsVals.length?mean(vsVals):null,colorOf:v=>v>line?"var(--good)":v<line?"var(--bad)":"var(--muted)",aria:`${ix.name} ${def.l} vs ${opp}`});
   return head0+`
@@ -622,7 +629,7 @@ function renderPlayers(){
     </div></section>
   ${vs.length?`<section class="grid2">
     <div class="panel"><h3 style="margin-bottom:8px">By season vs ${esc(opp)}</h3><div class="tbl"><table><thead><tr><th class="l">Season</th><th>GP</th>${kdefs.map(d=>`<th>${d.l}</th>`).join("")}<th>Over ${line}</th></tr></thead><tbody>${seasonRows}</tbody></table></div></div>
-    <div class="panel"><h3 style="margin-bottom:8px">Game log vs ${esc(opp)}</h3><div class="tbl" style="max-height:460px"><table><thead><tr><th class="l">Date</th><th class="l">Season</th><th class="l">Opp</th>${lg==="NBA"?"<th>Min</th>":""}<th>${esc(def.l)}</th>${cols.filter(c=>c!==def.k).map(c=>`<th>${(defs.find(d=>d.k===c)||{l:c}).l}</th>`).join("")}</tr></thead><tbody>${logRows}</tbody></table></div></div>
+    <div class="panel"><h3 style="margin-bottom:8px">Game log vs ${esc(opp)}</h3><div class="tbl" style="max-height:460px"><table><thead><tr><th class="l">Date</th><th class="l">Season</th><th class="l">Opp</th>${LG[lg].minLabel?`<th>${LG[lg].minLabel}</th>`:""}<th>${esc(def.l)}</th>${cols.filter(c=>c!==def.k).map(c=>`<th>${(defs.find(d=>d.k===c)||{l:c}).l}</th>`).join("")}</tr></thead><tbody>${logRows}</tbody></table></div></div>
   </section>`:""}`;
 }
 
@@ -638,7 +645,7 @@ function renderStatus(){
     <div class="tbl"><table><thead><tr><th class="l">Check</th><th class="l">Result</th><th class="l">Detail</th></tr></thead><tbody>
       <tr><td class="l">Latest games present</td><td class="l">${okPill(!(c.freshness&&c.freshness.missing&&c.freshness.missing.length))}</td><td class="l mini">${c.freshness&&c.freshness.missing&&c.freshness.missing.length?"Missing: "+esc(c.freshness.missing.join(", ")):"Every recently completed game is in the box scores"}</td></tr>
       <tr><td class="l">Scores match a second feed</td><td class="l">${xs.length?okPill(!xbad.length):'<span class="pill r-med">Not run</span>'}</td><td class="l mini">${xs.length?`${xs.length-xbad.length}/${xs.length} recent games match the check feed (see Sources)${xbad.length?": "+esc(xbad.map(x=>x.game+" ("+x.why+")").join("; ")):""}`:"Second feed wasn't available this update"}</td></tr>
-      ${S.league==="NBA"?`<tr><td class="l">Player points add up to team score</td><td class="l">${okPill(!(c.boxSum&&c.boxSum.bad||[]).some(x=>(x.match(/\d{4}-\d{2}-\d{2}/)||[""])[0]>=addYears(new Date().toISOString().slice(0,10),-1)))}</td><td class="l mini">${c.boxSum&&c.boxSum.bad&&c.boxSum.bad.length?`${c.boxSum.bad.length} older team-games off by a few points in the source (${esc(c.boxSum.bad.slice(0,3).join("; "))}…)`:"All team-games add up"}</td></tr>`:""}
+      ${LG[S.league].sumLabel?`<tr><td class="l">${LG[S.league].sumLabel}</td><td class="l">${okPill(!(c.boxSum&&c.boxSum.bad||[]).some(x=>(x.match(/\d{4}-\d{2}-\d{2}/)||[""])[0]>=addYears(new Date().toISOString().slice(0,10),-1)))}</td><td class="l mini">${c.boxSum&&c.boxSum.bad&&c.boxSum.bad.length?`${c.boxSum.bad.length} older team-games off by a few points in the source (${esc(c.boxSum.bad.slice(0,3).join("; "))}…)`:"All team-games add up"}</td></tr>`:""}
       <tr><td class="l">Injury report</td><td class="l">${inj.checked?okPill((inj.list||[]).every(x=>x.verified)):'<span class="pill r-high">Not verified</span>'}</td><td class="l mini">${esc(inj.source)} · ${(inj.list||[]).length} listed · ${(inj.list||[]).filter(x=>!x.verified).length} not matched to a roster</td></tr>
     </tbody></table></div>
   </section>
@@ -648,8 +655,10 @@ function renderStatus(){
       <p class="note">${esc(m.coverage?`${m.coverage.seasons} · ${m.coverage.playerGames.toLocaleString()} player-games · ${m.coverage.players.toLocaleString()} players · ${m.coverage.h2hGames.toLocaleString()} team games`:"")}</p></div>
     <div class="panel"><h3 style="margin-bottom:8px">Known limits</h3><ul class="note" style="margin:0;padding-left:18px">
       <li>No sportsbook prop feed is reachable, so every prop line and price is an estimate (EST).</li>
-      ${S.league==="NBA"?"<li>Injuries come from Rotowire's lineups page and are matched to real rosters. Expected minutes are estimated from the last 5 games.</li>":"<li>NFL injuries use the official report once it's published for the week. Until then they're marked not verified.</li><li>NFL snap counts aren't in the data, so projections don't scale for playing time.</li>"}
-      <li>Game spreads and totals come from ${S.league==="NBA"?"Rotowire":"nflverse"} and are for context only; they don't feed the model.</li></ul></div>
+      ${S.league==="NHL"?"<li>Only one goalie per team gets props: Rotowire's listed starter, or else whoever started the team's last game (flagged). Player stats cover 2023-24 onward; the source files for 2021-22 and 2022-23 have no game dates, so they're left out. Team results go back 5 seasons.</li>":""}
+      ${S.league==="MCBB"?"<li>Division 1 only: games against non-D1 teams are left out of both stats and results. Props need a player to have played for his team this season, so teams that haven't played yet show none. Only players averaging 12+ minutes get props. Injury reports for college are thin; treat status as not verified unless the Status tab says otherwise.</li>":""}
+      ${S.league==="NBA"?"<li>Injuries come from Rotowire's lineups page and are matched to real rosters. Expected minutes are estimated from the last 5 games.</li>":S.league==="NHL"||S.league==="MCBB"?"":"<li>NFL injuries use the official report once it's published for the week. Until then they're marked not verified.</li><li>NFL snap counts aren't in the data, so projections don't scale for playing time.</li>"}
+      <li>Game spreads and totals (when shown) come from ${S.league==="NFL"?"nflverse":S.league==="NBA"||S.league==="NHL"?"Rotowire or ESPN":"ESPN"} and are for context only; they don't feed the model.</li></ul></div>
   </section>`;
 }
 
@@ -663,7 +672,7 @@ function render(){
   const st=document.getElementById("srcStatus");
   st.textContent=S.conn==="ok"&&D&&D.meta?`Updated ${ago(D.meta.updatedAt)}`:S.conn==="connecting"?"Connecting…":S.conn==="empty"?"Waiting for first update":S.conn==="slow"?"Can't reach data yet":"Offline";
   st.className="status"+(S.conn==="ok"?"":" ex");
-  ["NBA","NFL"].forEach(l=>document.getElementById("lg"+l).setAttribute("aria-pressed",String(S.league===l)));
+  E.LEAGUES.forEach(l=>document.getElementById("lg"+l).setAttribute("aria-pressed",String(S.league===l)));
   VIEWS.forEach(v=>{const a=document.getElementById("tab-"+v);if(S.view===v)a.setAttribute("aria-current","page");else a.removeAttribute("aria-current");});
   const y=window.scrollY;let html;
   if(S.conn==="nodb")html=shell("Data isn't available in this view","Open the page while signed in to Claude to see live data.");
@@ -671,6 +680,7 @@ function render(){
   else if(S.conn==="slow")html=shell("Can't reach the data yet","Check your connection. The page keeps trying.");
   else if(S.conn==="error")html=shell("Couldn't read the data","Reload the page to try again.");
   else if(S.conn==="empty")html=shell("Waiting for the first update",`Updates run at ${RUN_TIMES.join(", ")} ET.`);
+  else if(S.ptr&&S.ptr.leagues&&!S.ptr.leagues[S.league])html=shell(`No ${S.league} data yet`,`It arrives with the next scheduled update (${RUN_TIMES.join(", ")} ET).`);
   else if(!D){load(S.league);html=shell(`Loading ${S.league}…`);}
   else if(D.error)html=shell(`Couldn't load ${S.league}`,"Reload the page to try again.");
   else html=S.view==="value"?renderValue():S.view==="deep"?renderDeep():S.view==="teams"?renderTeams():S.view==="players"?renderPlayers():S.view==="status"?renderStatus():renderBoard();
@@ -700,8 +710,7 @@ function onHeader(th){const tbl=th.closest("table");if(!tbl||!tbl.tHead||!tbl.tH
 function route(){const h=(location.hash||"").slice(1);const v=VIEWS.includes(h)?h:"board";const changed=v!==S.view;S.view=v;render();if(changed)window.scrollTo(0,0);}
 window.addEventListener("hashchange",route);
 const switchLeague=lg=>{S.league=lg;S.mv.game="all";S.deep={game:null,player:null,stat:null};S.tm={a:null,b:null,years:null,venue:"all",type:"all"};S.pv={id:null,opp:null,years:null,stat:null,line:null};S.f.game="all";S.f.stat="all";saveF();if(S.ptr)load(lg);render();};
-document.getElementById("lgNBA").onclick=()=>switchLeague("NBA");
-document.getElementById("lgNFL").onclick=()=>switchLeague("NFL");
+E.LEAGUES.forEach(l=>document.getElementById("lg"+l).onclick=()=>switchLeague(l));
 app.addEventListener("input",e=>{if(e.target.dataset.search)showResults(e.target);});
 app.addEventListener("focusin",e=>{const t=e.target;if(t.dataset&&t.dataset.search){t.select();showResults(t);}});
 app.addEventListener("keydown",e=>{const t=e.target;if((e.key==="Enter"||e.key===" ")&&t.matches&&t.matches(".tbl th")){e.preventDefault();onHeader(t);return;}if(!t.dataset||!t.dataset.search)return;
