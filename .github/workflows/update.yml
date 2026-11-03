@@ -1,0 +1,76 @@
+name: Update data and publish site
+
+# Runs at about 10:23 AM, 3:23 PM and 6:23 PM Eastern.
+# GitHub cron is UTC and ignores daylight saving, so it fires at both possible UTC hours
+# and the first step lets only the run that lands in the right Eastern window continue.
+on:
+  schedule:
+    - cron: "23 14,15,19,20,22,23 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.gate.outputs.go }}
+    steps:
+      - name: Check the Eastern time window
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then echo "go=1" >> "$GITHUB_OUTPUT"; exit 0; fi
+          NOW=$(( 10#$(TZ=America/New_York date +%H) * 60 + 10#$(TZ=America/New_York date +%M) ))
+          GO=0
+          for T in 623 923 1103; do   # 10:23, 15:23, 18:23 in minutes after midnight
+            if [ $NOW -ge $T ] && [ $NOW -lt $((T+55)) ]; then GO=1; fi
+          done
+          echo "Eastern minute of day: $NOW, go=$GO"
+          echo "go=$GO" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.go == '1'
+
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.go == '1'
+        with:
+          node-version: 20
+
+      - name: Download, check and model
+        if: steps.gate.outputs.go == '1'
+        run: |
+          set -o pipefail
+          node pipeline.js --work work --espn 1 --site _site | tee result.json
+          # Accuracy first: if either league failed, keep the previous site instead of publishing a partial one.
+          node -e 'const r=JSON.parse(require("fs").readFileSync("result.json","utf8").trim().split("\n").pop()); if(!r.ok||r.failed.length){console.error("League failed:",r.failed); process.exit(1);}'
+          cp work/out/report.md _site/data/report.md
+          cat work/out/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Add the app files
+        if: steps.gate.outputs.go == '1'
+        run: |
+          cp index.html engine.js _site/
+          touch _site/.nojekyll
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.gate.outputs.go == '1'
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.go == '1'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
