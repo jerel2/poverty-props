@@ -131,7 +131,7 @@ details.how ol,details.how ul{margin:8px 0 0;padding-left:20px;max-width:75ch}
   </div>
   <span class="status" id="srcStatus">Connecting…</span>
   <nav class="tabs" aria-label="Views">
-    <a href="#board" id="tab-board">Board</a><a href="#teams" id="tab-teams">Teams</a><a href="#players" id="tab-players">Players</a><a href="#deep" id="tab-deep">Deep dive</a><a href="#status" id="tab-status">Status</a>
+    <a href="#board" id="tab-board">Board</a><a href="#value" id="tab-value">Max Value</a><a href="#teams" id="tab-teams">Teams</a><a href="#players" id="tab-players">Players</a><a href="#deep" id="tab-deep">Deep dive</a><a href="#status" id="tab-status">Status</a>
   </nav>
 </div></header>
 
@@ -165,7 +165,7 @@ const etTime=iso=>new Date(iso).toLocaleString("en-US",{timeZone:"America/New_Yo
 const S={league:"NBA",view:"board",ver:0,ptr:null,conn:"connecting",
   L:{NBA:null,NFL:null},loading:{NBA:false,NFL:false},teamCache:{},
   f:{game:"all",stat:"all",minEdge:2,maxRisk:10,maxJuice:-155,maxPlus:200,onlyPos:true},
-  deep:{game:null,player:null,stat:null},tm:{a:null,b:null,years:null,venue:"all",type:"all"},pv:{id:null,opp:null,years:null,stat:null,line:null}};
+  mv:{mode:"top",sort:"model",game:"all"},deep:{game:null,player:null,stat:null},tm:{a:null,b:null,years:null,venue:"all",type:"all"},pv:{id:null,opp:null,years:null,stat:null,line:null}};
 S.my={};try{S.my=JSON.parse(localStorage.getItem("povprops.my")||"{}")||{};}catch(e){S.my={};}
 const saveMy=()=>{try{localStorage.setItem("povprops.my",JSON.stringify(S.my));}catch(e){}};
 const myKey=pr=>`${S.league}|${S.L[S.league]&&S.L[S.league].meta.slateDate}|${pr.player.id}|${pr.def.k}`;
@@ -313,6 +313,64 @@ function renderBoard(){
         <li><b>Risk</b> (1–10): volatility, sample size, minutes swings, injury tag, unverified injury status, recent role change, and price length.</li>
         <li><b>CHECK</b> tag: something about this player couldn't be confirmed. Tap the row to see what.</li>
       </ul></details>
+  </section>`;
+}
+
+/* ============ Max Value ============ */
+// Top 50: plays priced -250 or longer. Lotto: plays priced +150 or longer.
+// Both rank by a blend of implied %, edge % and value/risk (each scored 0-100 against the other plays, equal weight).
+const MV={top:{label:"Top 50",test:c=>c.imp<=E.amToProb(-250)+1e-9,desc:"Best 50 plays at an estimated price of -250 or longer"},
+          lotto:{label:"Lotto",test:c=>c.imp<=E.amToProb(150)+1e-9,desc:"Best 50 plays at an estimated price of +150 or longer"}};
+function maxValueList(mode){
+  const D=cur();const M=MV[mode];const out=[];
+  D.props.forEach(pr=>{if(/^(out|doubtful)$/i.test(pr.player.status))return;
+    if(S.mv.game!=="all"&&pr.player.game.id!==S.mv.game)return;
+    // within the price range, take the rung with the best value/risk (same rule as the board)
+    const l=lad(pr);let best=null;
+    l.rungs.forEach(c=>{if(!M.test(c))return;const risk=E.clamp(pr.baseRisk+(c.p<0.55?(0.55-c.p)*8:0),1,10);const vr=c.ev/risk;if(!best||vr>best.vr)best={...c,risk,vr};});if(!best)return;
+    const hist=arr=>{if(!arr.length)return null;const h=arr.filter(v=>best.side==="over"?v>best.L:v<best.L).length;return{h,n:arr.length};};
+    out.push({pr,c:best,l10:hist(pr.vals.slice(0,10)),vs:hist(pr.vsVals),risk:best.risk});});
+  // percentile score (0-100) for each factor, then the average
+  const pctRank=key=>{const v=out.map(key).slice().sort((a,b)=>a-b);return x=>{if(v.length<2)return 100;let lo=0,hi=v.length;const t=key(x);while(lo<hi){const m=(lo+hi)>>1;if(v[m]<t)lo=m+1;else hi=m;}return lo/(v.length-1)*100;};};
+  const pi=pctRank(x=>x.c.imp),pe=pctRank(x=>x.c.edge),pv=pctRank(x=>x.c.vr);
+  out.forEach(x=>{x.sImp=pi(x);x.sEdge=pe(x);x.sVR=pv(x);x.score=(x.sImp+x.sEdge+x.sVR)/3;});
+  out.sort((a,b)=>b.score-a.score||b.c.vr-a.c.vr);
+  return out.slice(0,50);
+}
+function renderValue(){
+  const D=cur();const mode=S.mv.mode;const M=MV[mode];const list=maxValueList(mode);
+  const hr=h=>h?`${h.h}/${h.n}`:"–";
+  const gameOpts=D.games.map(g=>`<option value="${esc(g.id)}" ${S.mv.game===g.id?"selected":""}>${esc(g.away)} @ ${esc(g.home)}</option>`).join("");
+  const rows=list.map((x,i)=>{const p=x.pr,c=x.c,pl=p.player;
+    const tags=(/active/i.test(pl.status)?"":` <span class="tag inj">${esc(pl.status)}</span>`)+(pl.flags.length?` <span class="tag est" title="${esc(pl.flags.join(" · "))}">CHECK</span>`:"");
+    return `<tr class="click" data-player="${esc(pl.id)}" data-stat="${p.def.k}">
+      <td class="num">${i+1}</td><td class="l"><b>${esc(pl.name)}</b> <span class="mini">${esc(pl.team)} v ${esc(pl.opp)}</span>${tags}</td>
+      <td class="l">${esc(p.def.l)}</td><td>${sideTxt(c)}</td>
+      <td class="num">${fmtAm(c.price)} ${c.est?'<span class="tag est">EST</span>':'<span class="tag mkt">YOURS</span>'}</td>
+      <td class="num"><b>${Math.round(x.score)}</b></td>
+      <td class="num">${pct(c.imp)}</td><td class="num">${pct(c.p)}</td>
+      <td class="num ${c.edge>=0?"pos":"neg"}">${sgnPct(c.edge)}</td><td class="num ${c.ev>=0?"pos":"neg"}">${(c.ev>=0?"+":"")+c.ev.toFixed(3)}</td>
+      <td>${riskPill(x.risk)}</td><td class="num">${c.vr.toFixed(3)}</td>
+      <td class="num">${hr(x.l10)}</td><td class="num">${hr(x.vs)}</td></tr>`;}).join("");
+  return `${freshness(D)}
+  <section class="panel" style="display:flex;flex-direction:column;gap:14px">
+    <div class="row spread"><h2>Max Value</h2>
+      <div class="seg" role="group" aria-label="Max Value list" style="border-color:var(--line)">
+        ${Object.entries(MV).map(([k,v])=>`<button data-mv="${k}" aria-pressed="${mode===k}">${v.label}</button>`).join("")}
+      </div></div>
+    <p class="note" style="margin:0">${M.desc}, ranked by <b>Score</b>: implied %, edge % and value/risk, each rated 0–100 against the other plays in this list and averaged equally. One play per player and stat (the rung with the best value/risk in this price range). Players listed out or doubtful are left off.</p>
+    <div class="filters">
+      <label for="mvGame">Game<select id="mvGame"><option value="all">All games</option>${gameOpts}</select></label>
+    </div>
+    <div class="tbl"><table>
+      <thead><tr><th>#</th><th class="l">Player</th><th class="l">Stat</th><th>Play</th><th>Price</th><th>Score</th><th>Implied</th><th>True</th><th>Edge</th><th>EV/u</th><th>Risk</th><th>V/R</th><th>Last 10</th><th>vs Opp</th></tr></thead>
+      <tbody>${rows||`<tr><td colspan="14" class="empty">No plays in this price range.</td></tr>`}</tbody>
+    </table></div>
+    <details class="how"><summary>Read this before betting</summary><ul class="note">
+      <li><b>Score</b> rewards a higher implied % (a safer price), a bigger edge, and a better value/risk, equally. <b>True</b> is the model's chance the play wins. <b>Last 10</b> and <b>vs Opp</b> are context only and don't affect the rank.</li>
+      <li>Prices are estimates (EST) unless you entered your book's odds. Check your book, then enter its odds on the player's page to get a true edge.</li>
+      <li>${mode==="top"?"Plays near -250 win often but lose a lot when they miss.":"Lotto plays miss most of the time by design. Keep stakes small."}</li>
+    </ul></details>
   </section>`;
 }
 
@@ -591,7 +649,7 @@ function renderStatus(){
 
 /* ============ Root render ============ */
 const app=document.getElementById("app");
-const VIEWS=["board","teams","players","deep","status"];
+const VIEWS=["board","value","teams","players","deep","status"];
 function shell(msg,sub){return `<div class="panel empty" style="display:flex;flex-direction:column;gap:8px;align-items:center"><h2>${msg}</h2>${sub?`<p class="note" style="margin:0">${sub}</p>`:""}</div>`;}
 function render(){
   const D=cur();
@@ -609,12 +667,12 @@ function render(){
   else if(S.conn==="empty")html=shell("Waiting for the first update",`Updates run at ${RUN_TIMES.join(", ")} ET.`);
   else if(!D){load(S.league);html=shell(`Loading ${S.league}…`);}
   else if(D.error)html=shell(`Couldn't load ${S.league}`,"Reload the page to try again.");
-  else html=S.view==="deep"?renderDeep():S.view==="teams"?renderTeams():S.view==="players"?renderPlayers():S.view==="status"?renderStatus():renderBoard();
+  else html=S.view==="value"?renderValue():S.view==="deep"?renderDeep():S.view==="teams"?renderTeams():S.view==="players"?renderPlayers():S.view==="status"?renderStatus():renderBoard();
   app.innerHTML=html;window.scrollTo(0,y);
 }
 function route(){const h=(location.hash||"").slice(1);const v=VIEWS.includes(h)?h:"board";const changed=v!==S.view;S.view=v;render();if(changed)window.scrollTo(0,0);}
 window.addEventListener("hashchange",route);
-const switchLeague=lg=>{S.league=lg;S.deep={game:null,player:null,stat:null};S.tm={a:null,b:null,years:null,venue:"all",type:"all"};S.pv={id:null,opp:null,years:null,stat:null,line:null};S.f.game="all";S.f.stat="all";saveF();if(S.ptr)load(lg);render();};
+const switchLeague=lg=>{S.league=lg;S.mv.game="all";S.deep={game:null,player:null,stat:null};S.tm={a:null,b:null,years:null,venue:"all",type:"all"};S.pv={id:null,opp:null,years:null,stat:null,line:null};S.f.game="all";S.f.stat="all";saveF();if(S.ptr)load(lg);render();};
 document.getElementById("lgNBA").onclick=()=>switchLeague("NBA");
 document.getElementById("lgNFL").onclick=()=>switchLeague("NFL");
 app.addEventListener("input",e=>{if(e.target.dataset.search)showResults(e.target);});
@@ -627,6 +685,7 @@ app.addEventListener("keydown",e=>{const t=e.target;if(!t.dataset||!t.dataset.se
 document.addEventListener("click",e=>{if(!e.target.closest(".srch"))hideResults();});
 app.addEventListener("click",e=>{
   const sp=e.target.closest("[data-search-pick]");if(sp){applySearch(sp.dataset.searchPick,sp.dataset.v);return;}
+  const mv=e.target.closest("[data-mv]");if(mv){S.mv.mode=mv.dataset.mv;render();return;}
   const tq=e.target.closest("[data-tm]");if(tq){const [a,b]=tq.dataset.tm.split("|");S.tm.a=a;S.tm.b=b;S.tm.venue="all";render();return;}
   const pq=e.target.closest("[data-pv]");if(pq){const [p,o]=pq.dataset.pv.split("|");S.pv={...S.pv,id:p,opp:o,stat:null,line:null};render();return;}
   if(e.target.closest("[data-open-deep]")){const p=cur().players.find(x=>x.id===S.pv.id);if(p)S.deep={game:p.game.id,player:p.id,stat:S.pv.stat};return;}
@@ -646,6 +705,7 @@ app.addEventListener("click",e=>{
 });
 app.addEventListener("change",e=>{const t=e.target;if(t.dataset.search)return;
   if(t.id==="dGame"){S.deep={game:t.value,player:null,stat:null};render();return;}
+  if(t.id==="mvGame"){S.mv.game=t.value;render();return;}
   const yv=v=>v==="all"?"all":+v;
   if(t.id==="tYears"){S.tm.years=yv(t.value);render();return;} if(t.id==="tType"){S.tm.type=t.value;render();return;} if(t.id==="tVenue"){S.tm.venue=t.value;render();return;}
   if(t.id==="pvYears"){S.pv.years=yv(t.value);render();return;} if(t.id==="pvStat"){S.pv.stat=t.value;S.pv.line=null;render();return;}
